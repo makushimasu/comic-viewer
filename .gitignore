@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller ビルド成果物
+*.spec.bak
+build/
+dist/
+
+# アプリが実行時に生成するファイル
+wood_cache.png
+library.json
+progress.json
+settings.json
+last_location.json
+thumb_cache/
+page_cache/
