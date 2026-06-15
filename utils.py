@@ -2,7 +2,7 @@
 import re
 from pathlib import Path
 
-# (ジャンル) [作家名] 作品名+α にマッチするパターン
+# (カテゴリ) [著者] タイトル+α にマッチするパターン
 _BRACKET_PATTERN = re.compile(
     r'^[\(\（].+?[\)\）]\s*[\[\［【].+?[\]\］】]\s*(.+)$'
 )
@@ -33,8 +33,8 @@ def natural_sort_key(name: str):
 
 def folder_has_bracket_pattern(folder_name: str) -> bool:
     """
-    フォルダ名が (ジャンル) [作家名] 作品名+α 形式かどうかを返す。
-    例: (一般コミック) [あかざわRED] 半熟てんちょ！ 全02巻 → True
+    フォルダ名が (カテゴリ) [著者] タイトル+α 形式かどうかを返す。
+    例: (Category) [Author] Title vol.1 → True
     """
     return bool(_BRACKET_PATTERN.match(Path(folder_name).stem if '.' in folder_name else folder_name))
 
@@ -44,7 +44,7 @@ def parse_filename(filename: str, use_bracket_rule: bool = False) -> dict:
     ファイル名から表示名を生成する。
 
     use_bracket_rule=True（現在フォルダがブラケットパターン）の場合:
-      (ジャンル) [作家名] 作品名+α.zip → 作品名+α  を返す
+      (カテゴリ) [著者] タイトル+α.zip → タイトル+α  を返す
       マッチしなければ拡張子なしのファイル名全体を返す
 
     use_bracket_rule=False の場合:
