@@ -5,7 +5,9 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-PAGE_CACHE_ROOT = Path.home() / "comic_viewer" / "page_cache"
+from appdir import APP_DIR
+
+PAGE_CACHE_ROOT = APP_DIR / "page_cache"
 PAGE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MAX_MB = 500
@@ -30,6 +32,45 @@ def get_cached_names(file_path: Path) -> Optional[list[str]]:
         if meta.get("mtime") != file_path.stat().st_mtime:
             return None
         return meta.get("original_names") or meta.get("pages", [])
+    except Exception:
+        return None
+
+
+def has_cached_pages(file_path: Path) -> bool:
+    """キャッシュの存在確認のみ。bytesを読み込まないので高速・低メモリ。"""
+    d = _cache_dir(file_path)
+    meta_file = _meta_path(d)
+    if not meta_file.exists():
+        return False
+    try:
+        meta = json.loads(meta_file.read_text(encoding='utf-8'))
+        if meta.get("mtime") != file_path.stat().st_mtime:
+            return False
+        return bool(meta.get("pages"))
+    except Exception:
+        return False
+
+
+def get_cached_paths(file_path: Path) -> Optional[list[Path]]:
+    """キャッシュ済みページをPathリストで返す。bytesを読まないのでメモリ節約。"""
+    d = _cache_dir(file_path)
+    meta_file = _meta_path(d)
+    if not meta_file.exists():
+        return None
+    try:
+        meta = json.loads(meta_file.read_text(encoding='utf-8'))
+        if meta.get("mtime") != file_path.stat().st_mtime:
+            return None
+        pages_names = meta.get("pages", [])
+        if not pages_names:
+            return None
+        paths = []
+        for name in pages_names:
+            p = d / name
+            if not p.exists():
+                return None
+            paths.append(p)
+        return paths
     except Exception:
         return None
 

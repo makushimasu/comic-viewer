@@ -22,6 +22,12 @@ import tempfile
 from pathlib import Path
 from zipfile import ZipFile, BadZipFile
 
+# Windowsでsubprocess呼び出し時にコンソール窓を出さないフラグ
+_NO_WINDOW: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW}
+    if os.name == "nt" else {}
+)
+
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
 
 ARCHIVE_EOF    =   1
@@ -62,7 +68,20 @@ def _detect_rar_version(file_path: Path) -> int:
 # ============================================================
 
 def _load_libarchive():
+    import sys
     lib_name = ctypes.util.find_library("archive")
+    # Windows では標準では見つからないため追加候補DLLを試みる
+    if not lib_name and sys.platform == "win32":
+        for candidate in (
+            "libarchive.dll", "archive.dll",
+            "libarchive-13.dll", "libarchive-14.dll", "libarchive-15.dll",
+        ):
+            try:
+                ctypes.CDLL(candidate)
+                lib_name = candidate
+                break
+            except OSError:
+                continue
     if not lib_name:
         return None
     try:
@@ -322,6 +341,27 @@ def _find_extractor() -> tuple[str, str] | None:
     利用可能な展開コマンドを探す。
     (コマンドパス, 種別) を返す。なければ None。
     """
+    import sys
+    if sys.platform == "win32":
+        # PATHにある場合を最初に確認
+        for name in ("7z", "7za", "7zz"):
+            p = shutil.which(name)
+            if p:
+                return (p, "7z")
+        # 7-Zip はデフォルトでPATHに追加されないため標準インストールパスも確認
+        for sz_path in (
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe",
+        ):
+            if Path(sz_path).exists():
+                return (sz_path, "7z")
+        # unrar (PATH)
+        p = shutil.which("unrar")
+        if p:
+            return (p, "unrar")
+        return None
+
+    # Linux / macOS
     unar = shutil.which("unar")
     if unar:
         return (unar, "unar")
@@ -333,9 +373,16 @@ def _find_extractor() -> tuple[str, str] | None:
 
 
 def _read_rar_via_command(file_path: Path) -> list[bytes]:
-    """unar または 7z コマンドで展開する"""
+    """unar / 7z / unrar コマンドで展開する"""
+    import sys
     extractor = _find_extractor()
     if extractor is None:
+        if sys.platform == "win32":
+            raise ArchiveError(
+                f"RARファイルを展開できません: {file_path.name}\n\n"
+                "7-Zip をインストールしてください:\n"
+                "  https://www.7-zip.org/"
+            )
         raise ArchiveError(
             f"RARファイルを展開できません: {file_path.name}\n\n"
             "以下のいずれかをインストールしてください:\n"
@@ -349,15 +396,20 @@ def _read_rar_via_command(file_path: Path) -> list[bytes]:
         if kind == "unar":
             proc = subprocess.run(
                 [cmd_path, "-o", tmp_dir, "-f", str(file_path)],
-                capture_output=True, timeout=120
+                capture_output=True, timeout=120, **_NO_WINDOW
             )
-        else:  # 7z
+        elif kind == "7z":
             proc = subprocess.run(
                 [cmd_path, "e", str(file_path), f"-o{tmp_dir}", "-y", "-bd"],
-                capture_output=True, timeout=120
+                capture_output=True, timeout=120, **_NO_WINDOW
+            )
+        else:  # unrar
+            proc = subprocess.run(
+                [cmd_path, "e", "-y", str(file_path), tmp_dir],
+                capture_output=True, timeout=120, **_NO_WINDOW
             )
 
-        # unarは成功でも1を返すことがある、7zも警告で1を返す
+        # unar/unrarは成功でも1を返すことがある、7zも警告で1を返す
         if proc.returncode not in (0, 1):
             raise ArchiveError(
                 f"展開コマンドがエラーを返しました (code {proc.returncode}):\n"
@@ -530,12 +582,94 @@ def read_all_images_with_names(file_path: Path) -> tuple[list[bytes], list[str]]
     raise ArchiveError(f"未対応の形式です: {file_path.suffix}")
 
 
+def _read_rar_cover_via_command(file_path: Path) -> bytes | None:
+    """
+    外部コマンド（7z / unrar）でRARの先頭画像1枚だけ取得する。
+    libarchiveが使えない環境（Windows標準等）でのサムネイル生成に使う。
+    全ページ展開ではなく先頭ファイルのみ展開して高速化する。
+    """
+    extractor = _find_extractor()
+    if extractor is None:
+        return None
+    cmd_path, kind = extractor
+
+    try:
+        # Step1: アーカイブ内の画像ファイル名リストを取得してソート
+        names = []
+        if kind == "7z":
+            proc = subprocess.run(
+                [cmd_path, "l", "-slt", str(file_path)],
+                capture_output=True, timeout=30, **_NO_WINDOW
+            )
+            for line_b in proc.stdout.splitlines():
+                for enc in ("utf-8", "cp932", "latin-1"):
+                    try:
+                        line = line_b.decode(enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    continue
+                s = line.strip()
+                if s.startswith("Path = "):
+                    name = s[7:]
+                    if name.lower().endswith(IMAGE_EXTS) and not name.endswith("/"):
+                        names.append(name)
+        elif kind == "unrar":
+            proc = subprocess.run(
+                [cmd_path, "lb", str(file_path)],
+                capture_output=True, timeout=30, **_NO_WINDOW
+            )
+            for line_b in proc.stdout.splitlines():
+                for enc in ("utf-8", "cp932", "latin-1"):
+                    try:
+                        name = line_b.decode(enc).strip()
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    continue
+                if name.lower().endswith(IMAGE_EXTS):
+                    names.append(name)
+        elif kind == "unar":
+            # unarはファイル一覧取得が複雑なため全展開で対応
+            pages = _read_rar_via_command(file_path)
+            return pages[0] if pages else None
+
+        if not names:
+            return None
+        first_file = sorted(names)[0]
+
+        # Step2: 先頭ファイルだけ一時ディレクトリに展開して読む
+        tmp_dir = tempfile.mkdtemp(prefix="comic_cover_")
+        try:
+            if kind == "7z":
+                subprocess.run(
+                    [cmd_path, "e", str(file_path), first_file,
+                     f"-o{tmp_dir}", "-y", "-bd"],
+                    capture_output=True, timeout=30, **_NO_WINDOW
+                )
+            elif kind == "unrar":
+                subprocess.run(
+                    [cmd_path, "e", "-y", str(file_path), first_file, tmp_dir],
+                    capture_output=True, timeout=30, **_NO_WINDOW
+                )
+            for p in Path(tmp_dir).rglob("*"):
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                    return p.read_bytes()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    except Exception as e:
+        print(f"[cover] コマンド失敗 {file_path.name}: {e}")
+
+    return None
+
+
 def read_cover(file_path: Path) -> bytes | None:
     """
     先頭の画像1枚だけを返す（サムネイル用・高速）。
-    RARはlibarchiveのみ使用。失敗時はNone（プレースホルダー表示）。
-    unarや7zは使わない（サムネイル生成が極端に遅くなるため）。
-    ビューアで開くときは read_all_images が unar を使う。
+    RARはlibarchiveを試み、失敗時は外部コマンド（7z/unrar等）で先頭1枚だけ展開する。
     """
     suffix = file_path.suffix.lower()
 
@@ -543,7 +677,10 @@ def read_cover(file_path: Path) -> bytes | None:
         return _read_zip_cover(file_path)
 
     if suffix in ('.rar', '.cbr'):
-        # libarchiveのみ。失敗してもunar/7zは呼ばない
-        return _read_rar_libarchive_cover(file_path)
+        result = _read_rar_libarchive_cover(file_path)
+        if result:
+            return result
+        # libarchive失敗時（Windows標準環境等）は外部コマンドで先頭画像のみ取得
+        return _read_rar_cover_via_command(file_path)
 
     raise ArchiveError(f"未対応の形式です: {file_path.suffix}")

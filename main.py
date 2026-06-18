@@ -20,15 +20,30 @@ from viewer import ViewerWindow
 from settings import load_settings, SettingsDialog
 from i18n import tr
 
-LIBRARY_DB    = Path.home() / "comic_viewer" / "library.json"
+from appdir import APP_DIR
 
-LAST_LOC_FILE = Path.home() / "comic_viewer" / "last_location.json"
-_UNRAR_NOTICE_FILE = Path.home() / "comic_viewer" / "unrar_notice_shown.flag"
+LIBRARY_DB         = APP_DIR / "library.json"
+LAST_LOC_FILE      = APP_DIR / "last_location.json"
+_UNRAR_NOTICE_FILE = APP_DIR / "unrar_notice_shown.flag"
 
 
 def _has_rar_support() -> bool:
-    """unar または unrar が使えるか確認（7zは除外）"""
+    """RAR展開手段が1つでも使えるか確認（libarchive / 7z / unrar）"""
+    import sys
     import shutil
+    from archive import _lib
+    if _lib is not None:
+        return True
+    if sys.platform == "win32":
+        for cmd in ("7z", "7za", "7zz", "unrar"):
+            if shutil.which(cmd):
+                return True
+        return any(
+            Path(p).exists() for p in (
+                r"C:\Program Files\7-Zip\7z.exe",
+                r"C:\Program Files (x86)\7-Zip\7z.exe",
+            )
+        )
     return any(shutil.which(cmd) for cmd in ("unar", "unrar"))
 
 
@@ -56,7 +71,9 @@ def _show_unrar_notice(parent=None):
     msg.setWindowTitle(tr("rar_title"))
     msg.setIcon(QMessageBox.Information)
     msg.setText(tr("rar_text"))
-    msg.setInformativeText(tr("rar_info"))
+    import sys as _sys
+    info_key = "rar_info" if _sys.platform == "win32" else "rar_info_linux"
+    msg.setInformativeText(tr(info_key))
     msg.setStyleSheet("""
         QMessageBox { background: #faf5ee; }
         QLabel { color: #1a0800; font-size: 11pt; }
@@ -156,17 +173,21 @@ class DirScanWorker(QObject):
                     if total > 0 and i % 10 == 0:
                         self.progress.emit(i + 1, total, self._generation)
             else:
-                # まずファイル名一覧を取得（1回のディレクトリ操作）
+                # os.scandir を使う: DirEntry.is_dir() は追加statコールなし
+                # （NTFSおよびSMBネットワークドライブでは一覧取得時に属性が含まれる）
+                import os
                 from utils import natural_sort_key
-                entries = [p for p in sorted(Path(self._folder).iterdir(),
-                                              key=lambda x: natural_sort_key(x.name))
-                          if not p.name.startswith('.')]
+                with os.scandir(self._folder) as sd:
+                    entries = sorted(
+                        [e for e in sd if not e.name.startswith('.')],
+                        key=lambda e: natural_sort_key(e.name)
+                    )
                 total = len(entries)
-                for i, p in enumerate(entries):
+                for i, entry in enumerate(entries):
                     try:
-                        result.append((str(p), p.is_dir()))
+                        result.append((entry.path, entry.is_dir()))
                     except Exception:
-                        result.append((str(p), not bool(p.suffix)))
+                        result.append((entry.path, not bool(Path(entry.name).suffix)))
                     # 10件ごとに進捗通知（シグナル発行コストを抑える）
                     if total > 0 and (i % 10 == 0 or i == total - 1):
                         self.progress.emit(i + 1, total, self._generation)
@@ -240,17 +261,29 @@ class WoodListView(QListView):
     棚板: paintEvent で super() の後に viewport 上に重ねて描画
     """
 
-    _WOOD_CACHE_PATH = str(Path.home() / "comic_viewer" / "wood_cache.png")
+    _WOOD_CACHE_PATH = str(APP_DIR / "wood_cache.png")
+
+    # スクロール後300msデバウンスして通知（BookshelfWindowがPixmap退避に使う）
+    scroll_stabilized = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._wood_generated = False
         self._wood_pixmap: QPixmap | None = None
+        self._scroll_evict_timer: QTimer | None = None
         self._wood_timer = None
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         self.setWordWrap(False)
         self.setTextElideMode(Qt.ElideNone)
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        if self._scroll_evict_timer is None:
+            self._scroll_evict_timer = QTimer(self)
+            self._scroll_evict_timer.setSingleShot(True)
+            self._scroll_evict_timer.timeout.connect(self.scroll_stabilized)
+        self._scroll_evict_timer.start(300)
 
     def wheelEvent(self, event):
         """1スクロールで1段（1行分）だけ移動する"""
@@ -332,8 +365,29 @@ class WoodListView(QListView):
         self._draw_shelf_boards(painter)
         painter.end()
 
+    def _update_grid_size(self):
+        """ビューポート幅いっぱいにアイテムが均等配置されるようgridSizeを動的調整する"""
+        vp_w = self.viewport().width()
+        if vp_w <= 0:
+            return
+        natural_w = self.sizeHintForColumn(0)
+        if natural_w <= 0:
+            natural_w = self.iconSize().width() + 4   # H_MARGIN * 2 フォールバック
+        natural_h = self.sizeHintForRow(0)
+        if natural_h <= 0:
+            return
+        cols = max(1, vp_w // natural_w)
+        cell_w = vp_w // cols
+        self.setGridSize(QSize(cell_w, natural_h))
+
+    def rowsInserted(self, parent, start, end):
+        super().rowsInserted(parent, start, end)
+        if start == 0:   # 最初のアイテム追加時にグリッドサイズを設定
+            self._update_grid_size()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._update_grid_size()
         # 再帰防止フラグ
         if getattr(self, '_in_resize', False):
             return
@@ -672,6 +726,8 @@ class ThumbnailWorker(QObject):
                 else:
                     img = create_thumbnail(p, size=self._thumb_size)
                 if img:
+                    # 表示サイズに縮小してからQPixmapに変換（メモリ節約）
+                    img.thumbnail(self._thumb_size, Image.LANCZOS)
                     return path_str, pil_to_qpixmap(img)
             except Exception:
                 pass
@@ -681,8 +737,11 @@ class ThumbnailWorker(QObject):
             """並列処理して結果をできた順にemit"""
             if not paths:
                 return
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures = {ex.submit(make_thumb, p): p for p in paths}
+            # withを使わず手動管理: stop()時にcancel_futures=Trueで即座にキャンセルする
+            # （withのcontextmanager exitはsubmit済み全futuresを待つため停止できない）
+            ex = ThreadPoolExecutor(max_workers=workers)
+            futures = {ex.submit(make_thumb, p): p for p in paths}
+            try:
                 for future in as_completed(futures):
                     if self._stopped:
                         break
@@ -691,6 +750,8 @@ class ThumbnailWorker(QObject):
                         self.thumbnails_batch.emit(
                             [(path_str, pixmap)], self._generation
                         )
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
 
         # ② キャッシュあり → 並列読み込み（最優先・ローカルなので高速）
         process_batch(cached_paths, workers=8)
@@ -698,13 +759,12 @@ class ThumbnailWorker(QObject):
         # ③ ZIPキャッシュなし → 並列生成（ネットワークI/Oを並列化）
         process_batch(uncached_zip, workers=4)
 
-        # ④ RARキャッシュなし → 逐次（libarchiveはスレッドセーフでない可能性）
-        for path_str in uncached_rar:
-            if self._stopped:
-                break
-            _, pixmap = make_thumb(path_str)
-            if pixmap:
-                self.thumbnails_batch.emit([(path_str, pixmap)], self._generation)
+        # ④ RARキャッシュなし
+        # libarchive は archive_t オブジェクト単位でスレッドセーフ。
+        # 各スレッドが独立した archive_read_new() を使うため並列処理は安全。
+        # RAR はデータ展開が重いためワーカー数は控えめに 2 とする。
+        if uncached_rar:
+            process_batch(uncached_rar, workers=2)
 
         self.finished.emit()
 
@@ -747,7 +807,7 @@ class BookshelfWindow(QMainWindow):
 
         self.settings = load_settings()
 
-        self.library_root = Path.home() / "comic_viewer"
+        self.library_root = APP_DIR
         self.library_root.mkdir(parents=True, exist_ok=True)
 
         self.registered_items = self.load_library()
@@ -775,6 +835,14 @@ class BookshelfWindow(QMainWindow):
         # 世代番号: フォルダ移動のたびに増加。古いワーカーの結果を無視するために使う
         self._view_generation: int = 0
 
+        # Pixmap LRU: RAMに保持するQPixmapを最大_PIXMAP_MAX件に制限する
+        from collections import OrderedDict
+        self._pixmap_lru: OrderedDict = OrderedDict()   # path_str → QStandardItem
+        # ウィンドウ型ロード用: 現在Pixmapが入っているモデル行番号の集合
+        self._loaded_rows: set[int] = set()
+        # ソフト停止した旧スレッドを自然終了まで保持するリスト（GC防止）
+        self._zombie_threads: list = []
+
         # current_folderの復元はバックグラウンドで行う（_restore_and_refresh内）
         # ネットワークドライブのスピンアップ中にUIがフリーズしないようにするため
         self.current_folder = None
@@ -782,6 +850,9 @@ class BookshelfWindow(QMainWindow):
         self.create_toolbar()
         self.create_menubar()
         self._build_central()
+
+        # スクロールが止まった300ms後: ウィンドウを再計算してPixmapを入れ替える
+        self.list_view.scroll_stabilized.connect(self._load_window_thumbnails)
 
         self._restore_window_state()
         # まずルート本棚を即表示し、last_book等の存在チェックはバックグラウンドで行う
@@ -1015,7 +1086,8 @@ class BookshelfWindow(QMainWindow):
 
     def create_toolbar(self):
         toolbar = QToolBar()
-        toolbar.setIconSize(QSize(32, 32))
+        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         toolbar.setContextMenuPolicy(Qt.PreventContextMenu)
         self.addToolBar(toolbar)
         self.toolbar = toolbar
@@ -1029,7 +1101,7 @@ class BookshelfWindow(QMainWindow):
         self.act_up.setToolTip(tr("toolbar_up_tip"))
 
         refresh = toolbar.addAction(QIcon.fromTheme("view-refresh"), tr("toolbar_refresh"))
-        refresh.triggered.connect(self.refresh_view)
+        refresh.triggered.connect(self._on_toolbar_refresh)
         refresh.setToolTip(tr("toolbar_refresh_tip"))
 
         self.act_back_to_shelf = toolbar.addAction(QIcon.fromTheme("go-previous"), tr("toolbar_back"))
@@ -1040,7 +1112,10 @@ class BookshelfWindow(QMainWindow):
         spacer.setSizePolicy(SP.Expanding, SP.Preferred)
         toolbar.addWidget(spacer)
 
-        settings_btn = toolbar.addAction(QIcon.fromTheme("preferences-system"), tr("toolbar_settings"))
+        _icon_settings = QIcon.fromTheme("preferences-system")
+        if _icon_settings.isNull():
+            _icon_settings = _make_gear_icon(int(toolbar.iconSize().width()))
+        settings_btn = toolbar.addAction(_icon_settings, tr("toolbar_settings"))
         settings_btn.triggered.connect(self.open_settings)
         settings_btn.setToolTip(tr("toolbar_settings_tip"))
 
@@ -1188,6 +1263,7 @@ class BookshelfWindow(QMainWindow):
         thumb_w = self.settings.get("thumbnail_width", 190)
         thumb_h = self.settings.get("thumbnail_height", 270)
         self.list_view.setIconSize(QSize(thumb_w, thumb_h))
+        self.list_view._update_grid_size()
 
         if not rebuild:
             # サムネイルサイズ以外の変更はモデル再構築不要
@@ -1390,6 +1466,8 @@ class BookshelfWindow(QMainWindow):
 
         self.model.clear()
         self._item_map = {}
+        self._pixmap_lru.clear()
+        self._loaded_rows.clear()
         self.loading_label.setText(tr("searching", query=query))
         self.loading_label.setVisible(True)
         self.list_view.setVisible(False)
@@ -1419,12 +1497,20 @@ class BookshelfWindow(QMainWindow):
             Path(self.current_folder).name if self.current_folder else ""
         )
 
+        _icon_folder = QIcon.fromTheme("folder")
+        if _icon_folder.isNull():
+            _icon_folder = QApplication.style().standardIcon(QStyle.SP_DirIcon)
+        _icon_file = QIcon.fromTheme("image-x-generic")
+        if _icon_file.isNull():
+            _icon_file = QApplication.style().standardIcon(QStyle.SP_FileIcon)
+
         file_paths = []
+        all_qitems = []
         for path_str in sorted(matched):
             path = Path(path_str)
             is_dir = not bool(path.suffix)  # suffixで判定（is_dir()不要）
             if is_dir:
-                display_name = path.name
+                display_name = path.name or str(path).rstrip('/\\')
             else:
                 parsed = parse_filename(path.name, use_bracket_rule=use_bracket_rule)
                 display_name = parsed.get("title") or path.stem
@@ -1436,17 +1522,20 @@ class BookshelfWindow(QMainWindow):
             qitem.setData(is_dir, IS_DIR_ROLE)
 
             if is_dir:
-                qitem.setIcon(QIcon.fromTheme("folder"))
+                qitem.setIcon(_icon_folder)
             else:
-                qitem.setIcon(QIcon.fromTheme("image-x-generic"))
+                qitem.setIcon(_icon_file)
                 file_paths.append(path_str)
                 self._item_map[path_str] = qitem
 
-            self.model.appendRow(qitem)
+            all_qitems.append(qitem)
+
+        if all_qitems:
+            self.model.invisibleRootItem().appendRows(all_qitems)
 
         self.count_label.setText(tr("search_results", n=len(matched)))
         if file_paths:
-            self._start_thumbnail_worker(file_paths, generation)
+            QTimer.singleShot(50, self._load_window_thumbnails)
 
     def _clear_search(self):
         self._stop_search_worker()
@@ -1469,6 +1558,22 @@ class BookshelfWindow(QMainWindow):
     # 表示更新（ディレクトリ列挙・サムネイル 完全非同期）
     # ------------------------------------------------------------------ #
 
+    def _on_toolbar_refresh(self):
+        """ツールバーの更新ボタン専用。
+        .noimg マーカー（サムネイル生成失敗の記録）を削除してから再スキャンする。
+        7-Zip インストール後などにボタンを押すと失敗済みサムネイルが再生成される。
+        """
+        try:
+            from core import CACHE_ROOT
+            for noimg in CACHE_ROOT.glob("*.noimg"):
+                noimg.unlink(missing_ok=True)
+                jpg = noimg.with_suffix('.jpg')
+                if jpg.exists():
+                    jpg.unlink(missing_ok=True)
+        except Exception:
+            pass
+        self.refresh_view()
+
     def refresh_view(self):
         # ① 世代番号を進める（古いワーカーの結果を無視するため）
         self._view_generation += 1
@@ -1480,6 +1585,8 @@ class BookshelfWindow(QMainWindow):
 
         # model.clear()はしない（_on_scan_doneで新データ構築後に切り替える）
         self._item_map: dict[str, QStandardItem] = {}
+        self._pixmap_lru.clear()
+        self._loaded_rows.clear()
 
         is_root = (self.current_folder is None)
         self.add_btn.setVisible(is_root)
@@ -1530,11 +1637,36 @@ class BookshelfWindow(QMainWindow):
             except RuntimeError:
                 pass
         try:
-            stop_thread_safely(self._thumb_thread)
+            # キャッシュなし2000ファイルの場合でもrun()がcancel_futures=Trueで即帰るため
+            # 既実行中ワーカー(最大8)の1枚分待ちで済む。余裕を持って10秒に設定
+            stop_thread_safely(self._thumb_thread, timeout_ms=10000)
         except RuntimeError:
             pass
         self._thumb_worker = None
         self._thumb_thread = None
+
+    def _soft_stop_thumbnail_worker(self):
+        """スクロール用ノンブロッキング停止: シグナルを切断して停止フラグを立てるだけ。
+        スレッドの終了は待たず、_zombie_threads で生存を保証して自然終了させる。"""
+        if self._thumb_worker:
+            self._thumb_worker.stop()
+            try:
+                self._thumb_worker.thumbnails_batch.disconnect()
+            except RuntimeError:
+                pass
+            self._thumb_worker = None
+        if self._thumb_thread:
+            thread = self._thumb_thread
+            self._thumb_thread = None
+            if thread.isRunning():
+                thread.quit()
+                self._zombie_threads.append(thread)
+                def _cleanup(t=thread):
+                    try:
+                        self._zombie_threads.remove(t)
+                    except ValueError:
+                        pass
+                thread.finished.connect(_cleanup)
 
     def _on_scan_progress(self, done: int, total: int, generation: int):
         if generation != self._view_generation:
@@ -1566,8 +1698,19 @@ class BookshelfWindow(QMainWindow):
         current_folder_name = Path(self.current_folder).name if self.current_folder else ""
         use_bracket_rule = folder_has_bracket_pattern(current_folder_name)
 
+        # アイコンをループ外で1回だけ取得する。
+        # Windows では standardIcon() が毎回リソースを検索するため
+        # 2000回ループ内で呼ぶと数秒のブロックが発生し「応答なし」になる。
+        _icon_folder = QIcon.fromTheme("folder")
+        if _icon_folder.isNull():
+            _icon_folder = QApplication.style().standardIcon(QStyle.SP_DirIcon)
+        _icon_file = QIcon.fromTheme("image-x-generic")
+        if _icon_file.isNull():
+            _icon_file = QApplication.style().standardIcon(QStyle.SP_FileIcon)
+
         file_paths = []
         file_count = 0
+        all_qitems = []  # 一括挿入用バッファ
 
         for item in items_to_show:
             # DirScanWorkerが (path_str, is_dir) タプルを返す
@@ -1586,7 +1729,7 @@ class BookshelfWindow(QMainWindow):
 
             # 表示名を決定（パス文字列操作のみ・ネットワークアクセスなし）
             if is_dir:
-                display_name = path.name
+                display_name = path.name or str(path).rstrip('/\\')
             else:
                 parsed = parse_filename(path.name, use_bracket_rule=use_bracket_rule)
                 display_name = parsed.get("title") or path.stem
@@ -1600,14 +1743,18 @@ class BookshelfWindow(QMainWindow):
             qitem.setToolTip("")
 
             if is_dir:
-                qitem.setIcon(QIcon.fromTheme("folder"))
+                qitem.setIcon(_icon_folder)
             else:
-                qitem.setIcon(QIcon.fromTheme("image-x-generic"))
+                qitem.setIcon(_icon_file)
                 file_paths.append(path_str)
             # フォルダ含む全アイテムを登録（スクロール位置復元に使用）
             self._item_map[path_str] = qitem
+            all_qitems.append(qitem)
 
-            self.model.appendRow(qitem)
+        # appendRow を N 回呼ぶと N 回 rowsInserted が発火してUIが固まる。
+        # appendRows で一括挿入すれば rowsInserted は1回だけ。
+        if all_qitems:
+            self.model.invisibleRootItem().appendRows(all_qitems)
 
         self.count_label.setText(tr("file_count", n=file_count) if file_count > 0 else "")
 
@@ -1617,7 +1764,8 @@ class BookshelfWindow(QMainWindow):
             self._back_to_shelf_show()
 
         if file_paths:
-            self._start_thumbnail_worker(file_paths, generation)
+            # ビューのレイアウト確定後にウィンドウ読み込みを開始
+            QTimer.singleShot(50, self._load_window_thumbnails)
 
     def _start_thumbnail_worker(self, paths: list[str], generation: int):
         thumb_size = (
@@ -1640,19 +1788,19 @@ class BookshelfWindow(QMainWindow):
         if generation != self._view_generation:
             return
         from page_cache import get_cached_pages as _gcp
-        from viewer import get_saved_page, load_progress
+        from viewer import load_progress, _progress_key
         from page_cache import get_cached_names as _gcn
         _progress = load_progress()
         for path_str, pixmap in batch:
             item = self._item_map.get(path_str)
             if item:
-                item.setData(pixmap, PIXMAP_ROLE)
+                self._register_pixmap(path_str, item, pixmap)
                 p = Path(path_str)
                 if p.suffix.lower() in ('.zip', '.cbz', '.rar', '.cbr'):
                     # キャッシュ済みフラグ
                     item.setData(_gcp(p) is not None, CACHED_ROLE)
-                    # しおり状態
-                    saved = get_saved_page(p)
+                    # しおり状態（_progressを使い回してファイルI/Oを1回に抑える）
+                    saved = _progress.get(_progress_key(p), {}).get("page", 0)
                     if saved > 0:
                         # 総ページ数をキャッシュメタから取得
                         names = _gcn(p)
@@ -1667,7 +1815,175 @@ class BookshelfWindow(QMainWindow):
             return
         item = self._item_map.get(path_str)
         if item:
-            item.setData(pixmap, PIXMAP_ROLE)
+            self._register_pixmap(path_str, item, pixmap)
+
+    _PIXMAP_MAX = 400   # RAMに保持するPixmap最大件数（400件 × ~200KB ≈ 80MB）
+
+    def _register_pixmap(self, path_str: str, item, pixmap: QPixmap):
+        """Pixmapをモデルに登録して _loaded_rows を更新する。"""
+        item.setData(pixmap, PIXMAP_ROLE)
+        idx = self.model.indexFromItem(item)
+        if idx.isValid():
+            self._loaded_rows.add(idx.row())
+        self._pixmap_lru[path_str] = item   # 後方互換のため保持
+
+    def _evict_distant_pixmaps(self):
+        """現在のスクロール位置から遠いアイテムのPixmapを優先的に解放する。
+        これにより、画面上の可視アイテムが消えるのを防ぐ。"""
+        excess = len(self._pixmap_lru) - self._PIXMAP_MAX
+        if excess <= 0:
+            return
+
+        item_h = self.list_view.sizeHintForRow(0)
+        item_w = self.list_view.sizeHintForColumn(0)
+        vp_w   = self.list_view.viewport().width()
+        vp_h   = self.list_view.viewport().height()
+        scroll_y = self.list_view.verticalScrollBar().value()
+
+        if item_h <= 0 or item_w <= 0 or vp_w <= 0:
+            # サイズ不明時は単純に古い順に解放（フォールバック）
+            for _ in range(excess):
+                if self._pixmap_lru:
+                    _, old_item = self._pixmap_lru.popitem(last=False)
+                    old_item.setData(None, PIXMAP_ROLE)
+            return
+
+        cols = max(1, vp_w // item_w)
+        # 画面中央の「ビジュアル行」番号
+        visible_center_vrow = (scroll_y + vp_h // 2) // item_h
+
+        # 全エントリについてビジュアル行との距離を算出
+        scored: list[tuple[int, str, object]] = []
+        for path_str, item in self._pixmap_lru.items():
+            idx = self.model.indexFromItem(item)
+            if not idx.isValid():
+                scored.append((999999, path_str, item))
+                continue
+            visual_row = idx.row() // cols
+            dist = abs(visual_row - visible_center_vrow)
+            scored.append((dist, path_str, item))
+
+        # 距離が遠い順（降順）にソートして excess 件を解放
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for i in range(min(excess, len(scored))):
+            dist, path_str, old_item = scored[i]
+            if path_str in self._pixmap_lru:
+                del self._pixmap_lru[path_str]
+                old_item.setData(None, PIXMAP_ROLE)
+
+    def _reload_visible_pixmaps(self):
+        """スクロール後、画面内にあってPixmapが解放されたアイテムをキャッシュから再読込む"""
+        from core import get_cache_path
+        vp = self.list_view.viewport()
+        vp_rect = vp.rect()
+        # ビューポートを格子状にサンプリングして可視インデックスを収集
+        seen: set[str] = set()
+        missing: list[str] = []
+        step = 40
+        for y in range(step // 2, vp_rect.height() + step, step):
+            for x in range(step // 2, vp_rect.width() + step, step):
+                idx = self.list_view.indexAt(QPoint(x, y))
+                if not idx.isValid():
+                    continue
+                path_str = idx.data(Qt.UserRole)
+                if not path_str or path_str in seen:
+                    continue
+                seen.add(path_str)
+                item = self._item_map.get(path_str)
+                if item and item.data(PIXMAP_ROLE) is None:
+                    missing.append(path_str)
+        if not missing:
+            return
+
+        thumb_size = (
+            self.settings.get("thumbnail_width", 190),
+            self.settings.get("thumbnail_height", 270),
+        )
+        gen = self._view_generation
+
+        def _load():
+            from PIL import Image
+            results = []
+            for path_str in missing:
+                cache = get_cache_path(Path(path_str))
+                if not cache.exists():
+                    continue
+                try:
+                    img = Image.open(cache)
+                    img.load()
+                    img.thumbnail(thumb_size, Image.LANCZOS)
+                    results.append((path_str, pil_to_qpixmap(img)))
+                except Exception:
+                    pass
+            QTimer.singleShot(0, lambda: _apply(results))
+
+        def _apply(results):
+            if self._view_generation != gen:
+                return
+            for path_str, px in results:
+                item = self._item_map.get(path_str)
+                if item:
+                    self._register_pixmap(path_str, item, px)
+
+        import threading
+        threading.Thread(target=_load, daemon=True).start()
+
+    THUMB_HALF_WINDOW = 50  # 画面中央から前後この件数のPixmapだけ保持
+
+    def _load_window_thumbnails(self):
+        """現在のスクロール位置を中心に ±THUMB_HALF_WINDOW 件だけPixmapをロード。
+        範囲外はPixmap解放、範囲内で未ロードのものはThumbnailWorkerで取得する。"""
+        if self.model.rowCount() == 0 or self._view_generation == 0:
+            return
+
+        # --- 中心モデル行を算出 ---
+        item_h = self.list_view.sizeHintForRow(0)
+        item_w = self.list_view.sizeHintForColumn(0)
+        vp_w   = self.list_view.viewport().width()
+        vp_h   = self.list_view.viewport().height()
+        scroll_y = self.list_view.verticalScrollBar().value()
+
+        if item_h > 0 and item_w > 0 and vp_w > 0:
+            cols = max(1, vp_w // item_w)
+            center_vrow = (scroll_y + vp_h // 2) // item_h
+            center_row  = center_vrow * cols + cols // 2
+        else:
+            center_row = 0
+
+        total = self.model.rowCount()
+        lo = max(0, center_row - self.THUMB_HALF_WINDOW)
+        hi = min(total - 1, center_row + self.THUMB_HALF_WINDOW)
+        window = set(range(lo, hi + 1))
+
+        # --- 範囲外のPixmapを解放 ---
+        for row in list(self._loaded_rows - window):
+            item = self.model.item(row)
+            if item:
+                item.setData(None, PIXMAP_ROLE)
+            self._loaded_rows.discard(row)
+
+        # --- 範囲内で未ロードのパスを収集 ---
+        to_load: list[str] = []
+        for row in range(lo, hi + 1):
+            if row in self._loaded_rows:
+                continue
+            item = self.model.item(row)
+            if item is None or item.data(IS_DIR_ROLE):
+                continue
+            path_str = item.data(Qt.UserRole)
+            if path_str and item.data(PIXMAP_ROLE) is None:
+                to_load.append(path_str)
+
+        if not to_load:
+            return
+
+        # --- ソフト停止（ブロックしない）して新しいウィンドウ分だけ起動 ---
+        self._soft_stop_thumbnail_worker()
+        self._start_thumbnail_worker(to_load, self._view_generation)
+
+    def _on_scroll_stabilized(self):
+        """スクロール停止後: 遠いPixmapを退避 → 画面内の空きを再読込（未使用・互換用）"""
+        self._load_window_thumbnails()
 
     # ------------------------------------------------------------------ #
     # ナビゲーション
@@ -1675,6 +1991,7 @@ class BookshelfWindow(QMainWindow):
 
     def go_home(self):
         self.current_folder = None
+        self.filepath_label.setText("")
         self._show_shelf()
         self.refresh_view()
 
@@ -1682,14 +1999,14 @@ class BookshelfWindow(QMainWindow):
         if self.current_folder is None:
             return
         parent = Path(self.current_folder).parent
-        parent_str = str(parent)
-        # is_dir()を呼ばずsuffixがないものをフォルダとして扱う
-        registered_dirs = [str(Path(p)) for p in self.registered_items if not Path(p).suffix]
+        # Pathオブジェクトで比較してOS問わず正しく動作させる
+        registered_dirs = [Path(p) for p in self.registered_items if not Path(p).suffix]
         under_registered = any(
-            parent_str == r or parent_str.startswith(r + "/")
+            parent == r or r in parent.parents
             for r in registered_dirs
         )
-        self.current_folder = parent_str if under_registered else None
+        self.current_folder = str(parent) if under_registered else None
+        self.filepath_label.setText("")
         self._show_shelf()
         self.refresh_view()
 
@@ -1871,6 +2188,7 @@ class BookshelfWindow(QMainWindow):
             else:
                 self.showNormal()
         self._show_shelf()
+        self.filepath_label.setText("")  # 前回選択ファイルのパス表示をクリア
         # ビューアの進捗を保存（closeEventは呼ばれないため明示的に保存）
         if self._inline_viewer is not None and self._inline_viewer.pages:
             from viewer import save_progress
@@ -2211,6 +2529,53 @@ class BookshelfWindow(QMainWindow):
 # スレッド安全停止ヘルパー
 # ============================================================
 
+def _make_gear_icon(size: int = 32) -> QIcon:
+    """QPainterで歯車アイコンを描画（QIcon.fromTheme未対応環境用）"""
+    import math
+    from PySide6.QtGui import QPainter, QBrush, QPainterPath
+    from PySide6.QtCore import QPointF
+
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    cx, cy = size / 2.0, size / 2.0
+    n = 8          # 歯数
+    r1 = size * 0.46  # 歯先半径
+    r2 = size * 0.30  # 歯底半径
+    r0 = size * 0.11  # 中心穴半径
+    tooth = 0.40   # 歯幅（1ピッチに対する割合）
+    step = 2 * math.pi / n
+
+    path = QPainterPath()
+    first = True
+    for i in range(n):
+        base = step * i
+        for r, a in [
+            (r2, base - step * (0.5 - tooth * 0.5)),
+            (r1, base - step * tooth * 0.5),
+            (r1, base + step * tooth * 0.5),
+            (r2, base + step * (0.5 - tooth * 0.5)),
+        ]:
+            x = cx + r * math.cos(a)
+            y = cy + r * math.sin(a)
+            if first:
+                path.moveTo(x, y)
+                first = False
+            else:
+                path.lineTo(x, y)
+    path.closeSubpath()
+    path.addEllipse(QPointF(cx, cy), r0, r0)  # OddEvenFillで中心穴を抜く
+
+    color = QApplication.palette().windowText().color()
+    painter.setBrush(QBrush(color))
+    painter.setPen(Qt.NoPen)
+    painter.drawPath(path)
+    painter.end()
+    return QIcon(pix)
+
+
 def stop_thread_safely(thread: QThread | None, timeout_ms: int = 3000):
     if thread is None:
         return
@@ -2218,12 +2583,26 @@ def stop_thread_safely(thread: QThread | None, timeout_ms: int = 3000):
         return
     thread.quit()
     if not thread.wait(timeout_ms):
-        print(f"警告: スレッドが {timeout_ms}ms 以内に終了しなかった。強制終了します。")
-        thread.terminate()
-        thread.wait(2000)
+        # terminate() は "QThread: Destroyed while still running" を引き起こすため使わない。
+        # タイムアウトしても処理継続 — ネットワーク遅延による一時的なブロックは自然解消する。
+        print(f"警告: スレッドが {timeout_ms}ms 以内に終了しなかった（継続して待機中）。")
 
 
 if __name__ == "__main__":
+    # ネットワークドライブが未接続のとき Windows が出す「場所が利用できません」
+    # ダイアログを抑制する。Path.exists() 等がエラーコードを返すだけになる。
+    if sys.platform == "win32":
+        import ctypes as _ctypes
+        _ctypes.windll.kernel32.SetErrorMode(0x8001)  # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
+        # タスクバーグループIDを明示設定。未設定だと python.exe や旧EXEと同じIDに
+        # なり、古いキャッシュアイコンがタスクバーに表示され続ける。
+        try:
+            _ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                'ComicViewer.App'
+            )
+        except Exception:
+            pass
+
     # venv PySide6 の fcitx プラグインは fcitx5 用のため、
     # fcitx4 環境では接続できず IME が動かない。
     # ibus が動いていれば QT_IM_MODULE=ibus に切り替えて直接入力を有効にする。
@@ -2243,6 +2622,13 @@ if __name__ == "__main__":
     )
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # アプリアイコン設定（タスクバー・タイトルバー・Alt+Tab）
+    # 開発時は __file__ の隣の icon.png、EXE 時は sys._MEIPASS に展開された icon.png を使う
+    _icon_base = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
+    _icon_file = _icon_base / 'icon.png'
+    if _icon_file.exists():
+        app.setWindowIcon(QIcon(str(_icon_file)))
 
     window = BookshelfWindow()
     # show()はスクロール復元後に_show_after_restoreから呼ばれる

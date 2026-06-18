@@ -2,16 +2,19 @@
 import json
 from pathlib import Path
 
+import shutil
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QCheckBox, QScrollArea, QWidget,
-    QRadioButton, QFrame, QComboBox
+    QRadioButton, QFrame, QComboBox, QMessageBox
 )
 from PySide6.QtGui import QFont
 from PySide6.QtCore import Qt
 
-SETTINGS_FILE = Path.home() / "comic_viewer" / "settings.json"
-SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+from appdir import APP_DIR
+
+SETTINGS_FILE = APP_DIR / "settings.json"
+APP_DIR.mkdir(parents=True, exist_ok=True)
 
 # デフォルト値
 DEFAULTS = {
@@ -235,6 +238,38 @@ class SettingsDialog(QDialog):
         lang_note.setStyleSheet("color: #888; font-size: 9pt;")
         layout.addWidget(lang_note)
 
+        layout.addWidget(self._divider())
+
+        # ---- キャッシュ管理 ----
+        layout.addWidget(self._section_label(tr("cache_mgmt_label")))
+
+        def _cache_btn(label: str, note_key: str, slot) -> QHBoxLayout:
+            btn = QPushButton(label)
+            btn.setFixedWidth(220)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: #c0392b; color: white;
+                    border-radius: 5px; padding: 6px 12px; font-weight: bold;
+                }
+                QPushButton:hover { background: #a93226; }
+            """)
+            btn.clicked.connect(slot)
+            note = QLabel(tr(note_key))
+            note.setStyleSheet("color: #888; font-size: 9pt;")
+            row = QHBoxLayout()
+            row.addWidget(btn)
+            row.addStretch()
+            vbox = QVBoxLayout()
+            vbox.setSpacing(2)
+            vbox.addLayout(row)
+            vbox.addWidget(note)
+            return vbox
+
+        layout.addLayout(_cache_btn(
+            tr("cache_thumb_btn"), "cache_thumb_note", self._clear_thumb_cache))
+        layout.addLayout(_cache_btn(
+            tr("cache_page_btn"),  "cache_page_note",  self._clear_page_cache))
+
         layout.addStretch()
 
         # ---- 保存ボタン ----
@@ -283,6 +318,79 @@ class SettingsDialog(QDialog):
         self.settings["language"]               = ["ja", "en"][self.combo_lang.currentIndex()]
         save_settings(self.settings)
         self.accept()
+
+    @staticmethod
+    def _msg_style() -> str:
+        return """
+            QMessageBox {
+                background: #faf5ee; color: #1a1a1a;
+            }
+            QMessageBox QLabel {
+                color: #1a1a1a; background: transparent; font-size: 10pt;
+            }
+            QPushButton {
+                background: #e8e0d5; color: #1a1a1a;
+                border: 1px solid #bbb; border-radius: 4px;
+                padding: 5px 18px; min-width: 60px;
+            }
+            QPushButton:hover { background: #d5ccc0; }
+            QPushButton:default { background: #5a8a3c; color: white; border-color: #4a7a2c; }
+            QPushButton:default:hover { background: #4a7a2c; }
+        """
+
+    def _confirm_dialog(self, title: str, text: str) -> bool:
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setIcon(QMessageBox.Question)
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        msg.setStyleSheet(self._msg_style())
+        return msg.exec() == QMessageBox.Yes
+
+    def _info_dialog(self, title: str, text: str):
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setIcon(QMessageBox.Information)
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.setStyleSheet(self._msg_style())
+        msg.exec()
+
+    def _warn_dialog(self, title: str, text: str):
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.setStyleSheet(self._msg_style())
+        msg.exec()
+
+    def _clear_thumb_cache(self):
+        from i18n import tr
+        if not self._confirm_dialog(tr("cache_del_confirm_title"), tr("cache_thumb_confirm")):
+            return
+        try:
+            thumb_dir = APP_DIR / "thumb_cache"
+            if thumb_dir.exists():
+                shutil.rmtree(thumb_dir)
+            thumb_dir.mkdir(parents=True, exist_ok=True)
+            self._info_dialog(tr("cache_del_ok_title"), tr("cache_thumb_del_ok"))
+        except Exception as e:
+            self._warn_dialog(tr("cache_del_err_title"), tr("cache_del_err").format(err=e))
+
+    def _clear_page_cache(self):
+        from i18n import tr
+        if not self._confirm_dialog(tr("cache_del_confirm_title"), tr("cache_page_confirm")):
+            return
+        try:
+            page_dir = APP_DIR / "page_cache"
+            if page_dir.exists():
+                shutil.rmtree(page_dir)
+            page_dir.mkdir(parents=True, exist_ok=True)
+            self._info_dialog(tr("cache_del_ok_title"), tr("cache_page_del_ok"))
+        except Exception as e:
+            self._warn_dialog(tr("cache_del_err_title"), tr("cache_del_err").format(err=e))
 
     def get_settings(self) -> dict:
         return self.settings

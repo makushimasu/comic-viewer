@@ -17,3 +17,6 @@ settings.json
 last_location.json
 thumb_cache/
 page_cache/
+
+# Windows バックアップ
+_backup/

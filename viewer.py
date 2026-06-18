@@ -19,8 +19,10 @@ from i18n import tr
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
 
-PROGRESS_FILE = Path.home() / "comic_viewer" / "progress.json"
-PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+from appdir import APP_DIR
+
+PROGRESS_FILE = APP_DIR / "progress.json"
+APP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -166,7 +168,7 @@ class PageLoadWorker(QObject):
             print(f"PageLoadWorker エラー {self._file_path}: {e}")
 
         if not self._cancelled:
-            if page_type == "archive":
+            if page_type in ("archive", "archive_cached"):
                 try:
                     from page_cache import get_cached_names
                     cached_names = get_cached_names(self._file_path)
@@ -179,15 +181,15 @@ class PageLoadWorker(QObject):
 
     def _load_archive(self):
         from archive import read_all_images_with_names, read_zip_streaming, ArchiveError
-        from page_cache import get_cached_pages, get_cached_names, save_cached_pages
+        from page_cache import get_cached_paths, get_cached_names, save_cached_pages
 
         suffix = self._file_path.suffix.lower()
 
-        # キャッシュ確認
-        cached = get_cached_pages(self._file_path)
-        if cached:
-            names = get_cached_names(self._file_path) or [f"{i+1:04d}" for i in range(len(cached))]
-            return cached, "archive", names
+        # キャッシュ確認: bytesではなくPathを返してメモリを節約する
+        cached_paths = get_cached_paths(self._file_path)
+        if cached_paths:
+            names = get_cached_names(self._file_path) or [f"{i+1:04d}" for i in range(len(cached_paths))]
+            return cached_paths, "archive_cached", names
 
         # ZIPはストリーミング展開（1ページ目からすぐ表示）
         if suffix in ('.zip', '.cbz'):
@@ -318,7 +320,7 @@ class ThumbStripWorker(QObject):
     def _emit_thumb(self, index: int, page):
         try:
             if self._page_type == "archive":
-                # bytes からの開き方: BytesIOは既にメモリにあるのでlazy openと同等
+                # bytes からの開き方
                 img = Image.open(io.BytesIO(page))
             else:
                 # ファイルパス: lazy open + thumbnail() でJPEGのdraftモードが効いて高速
@@ -534,7 +536,7 @@ class ViewerWindow(QMainWindow):
         self._overlay_visible = False
 
         # 木目テクスチャ（main.pyと共通のキャッシュ）をQPixmapとして読み込む
-        wood_path = Path.home() / "comic_viewer" / "wood_cache.png"
+        wood_path = APP_DIR / "wood_cache.png"
         wood_pixmap = QPixmap(str(wood_path)) if wood_path.exists() else None
         if wood_pixmap is not None and wood_pixmap.isNull():
             wood_pixmap = None
@@ -1242,9 +1244,11 @@ class ViewerWindow(QMainWindow):
         item = self.pages[index]
         try:
             if self._page_type == "archive":
-                img = safe_open_image(item)
+                img = safe_open_image(item)           # bytes
+            elif self._page_type == "archive_cached":
+                img = safe_open_image_from_path(item) # Path（ディスクキャッシュから読む）
             else:
-                img = safe_open_image_from_path(item)
+                img = safe_open_image_from_path(item) # Path（画像フォルダ）
             if img is None:
                 return None
             pix = pil_to_qpixmap(img)
@@ -1334,8 +1338,8 @@ class ViewerWindow(QMainWindow):
         # 上部オーバーレイにアーカイブ名と内部ファイル名、キャッシュ状態を表示
         archive_name = self.file_path.name
         cache_status = tr("cache_caching") if self._caching else tr("cache_done")
-        from page_cache import get_cached_pages
-        if not self._caching and get_cached_pages(self.file_path) is None:
+        from page_cache import has_cached_pages
+        if not self._caching and not has_cached_pages(self.file_path):
             cache_status = ""
         self.toolbar_label.setText(f"{archive_name}  ／  {inner_name}{cache_status}")
         status_name = f"  |  {inner_name}" if inner_name else ""
@@ -2109,9 +2113,13 @@ class ViewerWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
-        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
-            self._toggle_overlay()
-            return True
+        if event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.RightButton:
+                self._toggle_overlay()
+                return True
+            if event.button() == Qt.LeftButton:
+                if self._handle_click_navigation(event.position().x()):
+                    return True
         return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event):
@@ -2119,6 +2127,34 @@ class ViewerWindow(QMainWindow):
             self._toggle_overlay()
         else:
             super().mousePressEvent(event)
+
+    def _handle_click_navigation(self, click_x: float) -> bool:
+        """左端クリック→次ページ、右端クリック→前ページ（RTL時）。
+        オーバーレイ表示中・ズーム中は無効。クリックゾーン幅は幅の30%か250pxの小さい方。"""
+        if self._overlay_visible:
+            return False
+        if self.zoom != 1.0:
+            return False
+
+        vw = self.scroll_area.viewport().width()
+        zone = min(int(vw * 0.30), 250)
+
+        from settings import load_settings as _ls
+        rtl = _ls().get("reading_direction", "rtl") == "rtl"
+
+        if click_x < zone:
+            if rtl:
+                self.next_page()
+            else:
+                self.prev_page()
+            return True
+        if click_x > vw - zone:
+            if rtl:
+                self.prev_page()
+            else:
+                self.next_page()
+            return True
+        return False
 
     def _toggle_overlay(self):
         if self._slideshow_running:

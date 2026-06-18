@@ -2,7 +2,7 @@
 
 [English](README_EN.md) | 日本語
 
-Linux 向けのコミック・画像ビューアです。ZIP / RAR アーカイブや画像フォルダを本棚形式で管理し、快適に閲覧できます。
+Linux / Windows 向けのコミック・画像ビューアです。ZIP / RAR アーカイブや画像フォルダを本棚形式で管理し、快適に閲覧できます。
 
 ---
 
@@ -65,35 +65,57 @@ sudo apt install unrar
 
 ## 動作環境
 
-- **OS**: Linux（Ubuntu 22.04 / Linux Mint 21 以降を推奨）
-- **Python**: 3.10 以上
-- **日本語入力**: fcitx5 または ibus（日本語エンジン付き）を推奨
+| | Linux | Windows |
+|---|---|---|
+| OS | Ubuntu 22.04 / Linux Mint 21 以降 | Windows 10 / 11 |
+| Python | 3.10 以上 | 3.10 以上 |
+| RAR サポート | `unar` または `unrar` | 7-Zip |
 
 ---
 
 ## インストールと起動
 
+### Linux
+
 ```bash
 # 1. リポジトリをクローン
-git clone https://github.com/yourname/comic_viewer.git
-cd comic_viewer
+git clone https://github.com/makushimasu/comic-viewer.git
+cd comic-viewer
 
 # 2. 仮想環境を作成して有効化
 python3 -m venv venv
 source venv/bin/activate
 
 # 3. 依存パッケージをインストール
-pip install PySide6 Pillow
+pip install -r requirements.txt
 
 # 4. 起動
 python main.py
 ```
 
+### Windows
+
+```bat
+# 1. リポジトリをクローン（またはZIPをダウンロードして解凍）
+git clone https://github.com/makushimasu/comic-viewer.git
+cd comic-viewer
+
+# 2. start.bat をダブルクリック（初回は仮想環境を自動構築して起動）
+start.bat
+```
+
+**RAR サポート（Windows）**: [7-Zip](https://www.7-zip.org/) をインストールしてください。
+
 ---
 
 ## データの保存場所
 
-アプリのデータはすべて `~/comic_viewer/` 以下に保存されます。アンインストール時はこのフォルダを削除してください。
+| OS | パス |
+|---|---|
+| Linux | `~/comic_viewer/` |
+| Windows | `%LOCALAPPDATA%\comic_viewer\` |
+
+アプリのデータはすべて上記フォルダに保存されます。アンインストール時はこのフォルダを削除してください。
 
 | パス | 内容 |
 |------|------|

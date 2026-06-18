@@ -5,8 +5,9 @@ from PIL import Image
 import hashlib
 
 from archive import read_cover, ArchiveError
+from appdir import APP_DIR
 
-CACHE_ROOT = Path.home() / "comic_viewer" / "thumb_cache"
+CACHE_ROOT = APP_DIR / "thumb_cache"
 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 
@@ -75,9 +76,18 @@ def _get_placeholder_bytes() -> bytes:
         draw.rectangle([2, 2, 197, 277], outline=(200, 200, 200), width=2)
         # テキスト（フォントサイズを試みる）
         text = "No image"
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-        except Exception:
+        font = None
+        for font_path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux
+            "C:/Windows/Fonts/arial.ttf",                        # Windows
+            "C:/Windows/Fonts/segoeui.ttf",                      # Windows
+        ):
+            try:
+                font = ImageFont.truetype(font_path, 18)
+                break
+            except Exception:
+                continue
+        if font is None:
             font = ImageFont.load_default()
         bbox = draw.textbbox((0, 0), text, font=font)
         tw = bbox[2] - bbox[0]
