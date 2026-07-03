@@ -139,7 +139,7 @@ class PageLoadWorker(QObject):
         names = []
 
         try:
-            if suffix in ('.zip', '.cbz', '.rar', '.cbr'):
+            if suffix in ('.zip', '.cbz', '.rar', '.cbr', '.7z', '.cb7', '.pdf'):
                 pages, page_type, names = self._load_archive()
                 if self._cancelled:
                     return
@@ -211,6 +211,44 @@ class PageLoadWorker(QObject):
                 names = [names[i] for i in order]
 
             # キャッシュ保存
+            if pages:
+                try:
+                    from settings import load_settings
+                    max_mb = load_settings().get("page_cache_mb", 500)
+                    if max_mb > 0:
+                        worker_ref = self
+                        self.cache_start.emit()
+                        def _save():
+                            save_cached_pages(
+                                worker_ref._file_path, pages, max_mb, names,
+                                on_done=lambda: worker_ref.cache_done.emit()
+                            )
+                        import threading
+                        threading.Thread(target=_save, daemon=True).start()
+                except Exception as e:
+                    print(f"[page_cache] キャッシュ保存スキップ: {e}")
+            if pages:
+                return pages, "archive", names
+            # 画像が1枚もないZIP（PDF内包等）は下の全展開処理にフォールバックする
+
+        # PDFはページ単位でレンダリングしながら順次表示（ZIPストリーミングと同方式）
+        if suffix == '.pdf':
+            from archive import iter_pdf_pages
+            pages = []
+            names = []
+            try:
+                for idx, name, data in iter_pdf_pages(self._file_path):
+                    if self._cancelled:
+                        return pages, "archive", names
+                    pages.append(data)
+                    names.append(name)
+                    # 最初のページが描けたらすぐ通知
+                    self.page_ready.emit(idx, data)
+            except ArchiveError as e:
+                print(f"PDF展開エラー: {e}")
+                return [], "archive", []
+
+            # キャッシュ保存（JPEG化済みなので2回目以降は高速）
             if pages:
                 try:
                     from settings import load_settings
@@ -575,28 +613,37 @@ class ViewerWindow(QMainWindow):
                 painter.end()
                 super().paintEvent(event)
 
-        # lucide風のシンプルなSVGアイコン（線画スタイル）
+        # lucide風のSVGアイコン（黒線＋丸囲みで統一。本棚ツールバーと同スタイル）
+        def _circled(glyph: str) -> str:
+            """グリフを丸枠の中に縮小配置する。線幅は縮小率を補正して外周と揃える。"""
+            return (
+                '<circle cx="12" cy="12" r="10"/>'
+                '<g transform="translate(12 12) scale(0.55) translate(-12 -12)" '
+                'stroke-width="3.4">' + glyph + '</g>'
+            )
+
         LUCIDE_ICONS = {
-            "folder-open": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1H6a2 2 0 0 0-1.9 1.4L2 17V7z"/><path d="M2 17l2.4-7.2A2 2 0 0 1 6.3 8H20a2 2 0 0 1 1.9 2.6L20 17a2 2 0 0 1-1.9 1.4H4a2 2 0 0 1-2-1.4z"/>',
-            "library":     '<path d="M4 3h3v18H4z"/><path d="M9 3h3v18H9"/><path d="M16.5 3.7l3 17.7-3 .5-3-17.7z"/>',
-            "heart":       '<path d="M12 21s-7.5-4.6-9.6-9C1.1 9 2.5 5.5 6 5c2.1-.3 3.8.9 5 3 1.2-2.1 2.9-3.3 5-3 3.5.5 4.9 4 3.6 7-2.1 4.4-9.6 9-9.6 9z"/>',
-            "history":     '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-            "fullscreen":  '<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
-            "help":        '<circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 1 1 5.2 2c-.6.6-1.3 1-1.3 2"/><path d="M12 17h.01"/>',
-            "settings":    '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.6 1z"/>',
+            "folder-open": _circled('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1H6a2 2 0 0 0-1.9 1.4L2 17V7z"/><path d="M2 17l2.4-7.2A2 2 0 0 1 6.3 8H20a2 2 0 0 1 1.9 2.6L20 17a2 2 0 0 1-1.9 1.4H4a2 2 0 0 1-2-1.4z"/>'),
+            "library":     _circled('<path d="M4 3h3v18H4z"/><path d="M9 3h3v18H9"/><path d="M16.5 3.7l3 17.7-3 .5-3-17.7z"/>'),
+            "heart":       _circled('<path d="M12 21s-7.5-4.6-9.6-9C1.1 9 2.5 5.5 6 5c2.1-.3 3.8.9 5 3 1.2-2.1 2.9-3.3 5-3 3.5.5 4.9 4 3.6 7-2.1 4.4-9.6 9-9.6 9z"/>'),
+            # 元から円形のアイコンは外周をr=10に合わせるだけでよい
+            "history":     '<circle cx="12" cy="12" r="10"/><path d="M12 7v5l3 2"/>',
+            "fullscreen":  _circled('<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>'),
+            "help":        '<circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 1 1 5.2 2c-.6.6-1.3 1-1.3 2"/><path d="M12 17h.01"/>',
+            "settings":    _circled('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.6 1z"/>'),
             # ---- 下部メニュー用 ----
-            "book-plus":   '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z"/><path d="M9 7h6"/><path d="M12 4v6"/>',
-            "move":        '<polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/>',
-            "page":        '<rect x="4" y="2" width="16" height="20" rx="2"/><line x1="8" y1="7" x2="16" y2="7"/><line x1="8" y1="11" x2="16" y2="11"/><line x1="8" y1="15" x2="12" y2="15"/>',
-            "bookmark":    '<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>',
-            "play":        '<polygon points="6 3 20 12 6 21 6 3"/>',
-            "maximize":    '<rect x="3" y="3" width="18" height="18" rx="2"/>',
-            "book-open":   '<path d="M2 4h7a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H2z"/><path d="M22 4h-7a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h7z"/>',
-            "flip-horizontal": '<path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="2" x2="12" y2="22" stroke-dasharray="3 3"/>',
-            "more":        '<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>',
+            "book-plus":   _circled('<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z"/><path d="M9 7h6"/><path d="M12 4v6"/>'),
+            "move":        _circled('<polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/>'),
+            "page":        _circled('<rect x="4" y="2" width="16" height="20" rx="2"/><line x1="8" y1="7" x2="16" y2="7"/><line x1="8" y1="11" x2="16" y2="11"/><line x1="8" y1="15" x2="12" y2="15"/>'),
+            "bookmark":    _circled('<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>'),
+            "play":        _circled('<polygon points="6 3 20 12 6 21 6 3"/>'),
+            "maximize":    _circled('<rect x="3" y="3" width="18" height="18" rx="2"/>'),
+            "book-open":   _circled('<path d="M2 4h7a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H2z"/><path d="M22 4h-7a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h7z"/>'),
+            "flip-horizontal": _circled('<path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="2" x2="12" y2="22" stroke-dasharray="3 3"/>'),
+            "more":        '<circle cx="12" cy="12" r="10"/><path d="M16.5 12h.01"/><path d="M12 12h.01"/><path d="M7.5 12h.01"/>',
         }
 
-        def _lucide_icon(key: str, color: str = "#3a2000") -> QIcon:
+        def _lucide_icon(key: str, color: str = "#1a1a1a") -> QIcon:
             inner = LUCIDE_ICONS.get(key, "")
             svg = (
                 f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '

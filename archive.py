@@ -203,7 +203,7 @@ def _scan_names(a) -> list[str]:
 
 
 def _read_all_data(a) -> list[tuple[str, bytes]]:
-    """アーカイブ内の全画像をデータごと読む"""
+    """アーカイブ内の全画像（およびPDF）をデータごと読む"""
     collected = []
     entry = ctypes.c_void_p()
     fatal_count = 0
@@ -220,7 +220,9 @@ def _read_all_data(a) -> list[tuple[str, bytes]]:
             continue
         fatal_count = 0
         name = _entry_name(entry)
-        if name and name.lower().endswith(IMAGE_EXTS) and not name.endswith('/'):
+        if (name and not name.endswith('/')
+                and (name.lower().endswith(IMAGE_EXTS)
+                     or name.lower().endswith('.pdf'))):
             data = _read_entry_data(a)
             if data:
                 collected.append((name, data))
@@ -255,9 +257,23 @@ def _read_rar_libarchive_all_with_names(file_path: Path) -> tuple[list[bytes], l
 
         if collected:
             collected.sort(key=lambda x: x[0])
-            names = [Path(n).name for n, _ in collected]
-            pages = [d for _, d in collected]
-            return pages, names
+            images = [(n, d) for n, d in collected if n.lower().endswith(IMAGE_EXTS)]
+            if images:
+                names = [Path(n).name for n, _ in images]
+                pages = [d for _, d in images]
+                return pages, names
+            # 画像がなくPDFが含まれる場合: PDFのページを展開して返す
+            pdfs = [(n, d) for n, d in collected if n.lower().endswith('.pdf')]
+            pages = []
+            names = []
+            for pname, data in pdfs:
+                p_pages = _pdf_bytes_all_pages(data)
+                base = Path(pname).stem
+                for j, d in enumerate(p_pages):
+                    pages.append(d)
+                    names.append(f"{base}_{j+1:04d}.jpg")
+            if pages:
+                return pages, names
 
     return [], []
 
@@ -281,6 +297,7 @@ def _read_rar_libarchive_cover(file_path: Path) -> bytes | None:
         return None
 
     ver = _detect_rar_version(file_path)
+    first_pdf_data = None  # 画像が1枚もない場合のPDFフォールバック用
     for rar_ver in ([ver, 0] if ver else [0]):
         a = _open_libarchive(file_path, rar_ver)
         if a is None:
@@ -319,6 +336,8 @@ def _read_rar_libarchive_cover(file_path: Path) -> bytes | None:
                             break
                     else:
                         _lib.archive_read_data_skip(a)
+                elif name.lower().endswith('.pdf') and first_pdf_data is None:
+                    first_pdf_data = _read_entry_data(a)
                 else:
                     _lib.archive_read_data_skip(a)
         finally:
@@ -326,6 +345,12 @@ def _read_rar_libarchive_cover(file_path: Path) -> bytes | None:
 
         if result:
             return result
+
+    # 画像がなくPDFが含まれる場合: 先頭PDFの1ページ目を表紙にする
+    if first_pdf_data:
+        cover = _pdf_bytes_cover(first_pdf_data)
+        if cover:
+            return cover
 
     # 全て失敗 → メモリキャッシュに記録
     _rar_failed_cache.add(path_str)
@@ -417,11 +442,22 @@ def _read_rar_via_command(file_path: Path) -> list[bytes]:
             )
 
         result = []
+        pdf_files = []
         for p in sorted(Path(tmp_dir).rglob("*")):
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+            if not p.is_file():
+                continue
+            if p.suffix.lower() in IMAGE_EXTS:
                 result.append((p.name, p.read_bytes()))
-        result.sort(key=lambda x: x[0])
-        return [d for _, d in result]
+            elif p.suffix.lower() == '.pdf':
+                pdf_files.append(p)
+        if result:
+            result.sort(key=lambda x: x[0])
+            return [d for _, d in result]
+        # 画像がなくPDFが含まれる場合: PDFのページを展開して返す
+        pages = []
+        for p in sorted(pdf_files, key=lambda x: x.name):
+            pages.extend(_pdf_bytes_all_pages(p.read_bytes()))
+        return pages
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -512,16 +548,33 @@ def _read_zip_all_with_names(file_path: Path) -> tuple[list[bytes], list[str]]:
     try:
         with ZipFile(file_path) as z:
             entries = []
+            pdf_entries = []
             for info in z.infolist():
                 if info.is_dir():
                     continue
                 name = _decode_zip_name(info)
                 if name.lower().endswith(IMAGE_EXTS):
                     entries.append((name, info))
-            entries.sort(key=lambda x: x[0])
-            pages = [z.read(info) for _, info in entries]
-            base_names = [Path(name).name for name, _ in entries]
-            return pages, base_names
+                elif name.lower().endswith('.pdf'):
+                    pdf_entries.append((name, info))
+            if entries:
+                entries.sort(key=lambda x: x[0])
+                pages = [z.read(info) for _, info in entries]
+                base_names = [Path(name).name for name, _ in entries]
+                return pages, base_names
+            # 画像がなくPDFが含まれる場合: PDFのページを展開して返す
+            if pdf_entries:
+                pdf_entries.sort(key=lambda x: x[0])
+                pages = []
+                names = []
+                for pname, info in pdf_entries:
+                    p_pages = _pdf_bytes_all_pages(z.read(info))
+                    base = Path(pname).stem
+                    for j, d in enumerate(p_pages):
+                        pages.append(d)
+                        names.append(f"{base}_{j+1:04d}.jpg")
+                return pages, names
+            return [], []
     except BadZipFile as e:
         raise ArchiveError(f"ZIPが壊れています: {e}")
 
@@ -538,19 +591,165 @@ def _read_zip_cover(file_path: Path) -> bytes | None:
     try:
         with ZipFile(file_path) as z:
             entries = []
+            pdf_entries = []
             for info in z.infolist():
                 if info.is_dir():
                     continue
                 name = _decode_zip_name(info)
                 if name.lower().endswith(IMAGE_EXTS):
                     entries.append((name, info))
-            if not entries:
-                return None
-            entries.sort(key=lambda x: x[0])
-            return z.read(entries[0][1])
+                elif name.lower().endswith('.pdf'):
+                    pdf_entries.append((name, info))
+            if entries:
+                entries.sort(key=lambda x: x[0])
+                return z.read(entries[0][1])
+            # 画像がなくPDFが含まれる場合: 先頭PDFの1ページ目を表紙にする
+            if pdf_entries:
+                pdf_entries.sort(key=lambda x: x[0])
+                return _pdf_bytes_cover(z.read(pdf_entries[0][1]))
+            return None
     except BadZipFile as e:
         raise ArchiveError(f"ZIPが壊れています: {e}")
     except Exception:
+        return None
+
+
+# ============================================================
+# PDF（pypdfium2 — BSDライセンス。無ければPDF機能は無効になる）
+# ============================================================
+
+_PDF_RENDER_LONG_SIDE = 2000   # ビューア用レンダリングの長辺ピクセル
+_PDF_COVER_LONG_SIDE  = 600    # サムネイル用
+
+
+def has_pdf_support() -> bool:
+    """pypdfium2 が利用可能か（PDF対応の有効/無効判定に使う）"""
+    try:
+        import pypdfium2  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _render_pdf_page_jpeg(page, long_side: int) -> bytes:
+    """PdfPage をレンダリングして JPEG bytes を返す"""
+    w, h = page.get_size()
+    scale = long_side / max(w, h)
+    bitmap = page.render(scale=scale)
+    pil = bitmap.to_pil()
+    if pil.mode != "RGB":
+        pil = pil.convert("RGB")
+    buf = io.BytesIO()
+    pil.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def iter_pdf_pages(file_path: Path):
+    """
+    PDFを先頭から1ページずつレンダリングして (index, name, jpeg_bytes) をyieldする。
+    ZIPストリーミングと同様に、先頭ページから順次表示できる。
+    """
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        raise ArchiveError(
+            f"PDFを開くには pypdfium2 が必要です: {file_path.name}\n\n"
+            "pip install pypdfium2"
+        )
+    pdf = pdfium.PdfDocument(str(file_path))
+    try:
+        for i in range(len(pdf)):
+            page = pdf[i]
+            try:
+                data = _render_pdf_page_jpeg(page, _PDF_RENDER_LONG_SIDE)
+            except Exception as e:
+                print(f"[pdf] ページ{i+1}のレンダリング失敗 {file_path.name}: {e}")
+                continue
+            finally:
+                page.close()
+            yield i, f"{i+1:04d}.jpg", data
+    finally:
+        pdf.close()
+
+
+def read_pdf_all_with_names(file_path: Path) -> tuple[list[bytes], list[str]]:
+    """PDFの全ページをJPEG bytesで返す"""
+    pages = []
+    names = []
+    for _, name, data in iter_pdf_pages(file_path):
+        pages.append(data)
+        names.append(name)
+    return pages, names
+
+
+def read_pdf_cover(file_path: Path) -> bytes | None:
+    """PDFの1ページ目だけレンダリングして返す（サムネイル用）"""
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return None
+    try:
+        pdf = pdfium.PdfDocument(str(file_path))
+        try:
+            if len(pdf) == 0:
+                return None
+            page = pdf[0]
+            try:
+                return _render_pdf_page_jpeg(page, _PDF_COVER_LONG_SIDE)
+            finally:
+                page.close()
+        finally:
+            pdf.close()
+    except Exception as e:
+        print(f"[pdf] 表紙生成失敗 {file_path.name}: {e}")
+        return None
+
+
+def _pdf_bytes_all_pages(data: bytes) -> list[bytes]:
+    """PDFのbytes（アーカイブ内から抽出したもの等）を全ページJPEGにレンダリングする"""
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return []
+    pages = []
+    try:
+        pdf = pdfium.PdfDocument(data)
+        try:
+            for i in range(len(pdf)):
+                page = pdf[i]
+                try:
+                    pages.append(_render_pdf_page_jpeg(page, _PDF_RENDER_LONG_SIDE))
+                except Exception as e:
+                    print(f"[pdf] ページ{i+1}のレンダリング失敗: {e}")
+                finally:
+                    page.close()
+        finally:
+            pdf.close()
+    except Exception as e:
+        print(f"[pdf] 展開失敗: {e}")
+    return pages
+
+
+def _pdf_bytes_cover(data: bytes) -> bytes | None:
+    """PDFのbytesから1ページ目だけレンダリングする（アーカイブ内PDFのサムネイル用）"""
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return None
+    try:
+        pdf = pdfium.PdfDocument(data)
+        try:
+            if len(pdf) == 0:
+                return None
+            page = pdf[0]
+            try:
+                return _render_pdf_page_jpeg(page, _PDF_COVER_LONG_SIDE)
+            finally:
+                page.close()
+        finally:
+            pdf.close()
+    except Exception as e:
+        print(f"[pdf] 表紙生成失敗: {e}")
         return None
 
 
@@ -571,7 +770,11 @@ def read_all_images_with_names(file_path: Path) -> tuple[list[bytes], list[str]]
     if suffix in ('.zip', '.cbz'):
         return _read_zip_all_with_names(file_path)
 
-    if suffix in ('.rar', '.cbr'):
+    if suffix == '.pdf':
+        return read_pdf_all_with_names(file_path)
+
+    if suffix in ('.rar', '.cbr', '.7z', '.cb7'):
+        # libarchiveの汎用リーダー（format_all）は7zも展開できる
         result = _read_rar_libarchive_all_with_names(file_path)
         if result[0]:
             return result
@@ -594,8 +797,9 @@ def _read_rar_cover_via_command(file_path: Path) -> bytes | None:
     cmd_path, kind = extractor
 
     try:
-        # Step1: アーカイブ内の画像ファイル名リストを取得してソート
+        # Step1: アーカイブ内の画像/PDFファイル名リストを取得してソート
         names = []
+        pdf_names = []
         if kind == "7z":
             proc = subprocess.run(
                 [cmd_path, "l", "-slt", str(file_path)],
@@ -613,8 +817,12 @@ def _read_rar_cover_via_command(file_path: Path) -> bytes | None:
                 s = line.strip()
                 if s.startswith("Path = "):
                     name = s[7:]
-                    if name.lower().endswith(IMAGE_EXTS) and not name.endswith("/"):
+                    if name.endswith("/"):
+                        continue
+                    if name.lower().endswith(IMAGE_EXTS):
                         names.append(name)
+                    elif name.lower().endswith(".pdf"):
+                        pdf_names.append(name)
         elif kind == "unrar":
             proc = subprocess.run(
                 [cmd_path, "lb", str(file_path)],
@@ -631,14 +839,21 @@ def _read_rar_cover_via_command(file_path: Path) -> bytes | None:
                     continue
                 if name.lower().endswith(IMAGE_EXTS):
                     names.append(name)
+                elif name.lower().endswith(".pdf"):
+                    pdf_names.append(name)
         elif kind == "unar":
             # unarはファイル一覧取得が複雑なため全展開で対応
+            # （_read_rar_via_command はPDFのみのアーカイブも処理できる）
             pages = _read_rar_via_command(file_path)
             return pages[0] if pages else None
 
-        if not names:
+        # 画像があれば先頭画像を、なければ先頭PDFを対象にする
+        if names:
+            first_file = sorted(names)[0]
+        elif pdf_names:
+            first_file = sorted(pdf_names)[0]
+        else:
             return None
-        first_file = sorted(names)[0]
 
         # Step2: 先頭ファイルだけ一時ディレクトリに展開して読む
         tmp_dir = tempfile.mkdtemp(prefix="comic_cover_")
@@ -655,8 +870,12 @@ def _read_rar_cover_via_command(file_path: Path) -> bytes | None:
                     capture_output=True, timeout=30, **_NO_WINDOW
                 )
             for p in Path(tmp_dir).rglob("*"):
-                if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() in IMAGE_EXTS:
                     return p.read_bytes()
+                if p.suffix.lower() == '.pdf':
+                    return _pdf_bytes_cover(p.read_bytes())
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -676,7 +895,11 @@ def read_cover(file_path: Path) -> bytes | None:
     if suffix in ('.zip', '.cbz'):
         return _read_zip_cover(file_path)
 
-    if suffix in ('.rar', '.cbr'):
+    if suffix == '.pdf':
+        return read_pdf_cover(file_path)
+
+    if suffix in ('.rar', '.cbr', '.7z', '.cb7'):
+        # libarchiveの汎用リーダー（format_all）は7zも展開できる
         result = _read_rar_libarchive_cover(file_path)
         if result:
             return result

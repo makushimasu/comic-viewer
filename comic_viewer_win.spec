@@ -17,6 +17,8 @@ a = Analysis(
         'PySide6.QtSvg',
         'PySide6.QtXml',
         'PySide6.QtPrintSupport',
+        # PDF対応（pdfium DLLはhooks-contribが自動収集する）
+        'pypdfium2', 'pypdfium2_raw',
     ],
     hookspath=[],
     hooksconfig={},
@@ -53,7 +55,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
+    upx=False,              # UPX圧縮無効（有効にするとAVの誤検知が増える）
     console=False,          # コンソールウィンドウを非表示
     disable_windowed_traceback=False,
     argv_emulation=False,

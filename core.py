@@ -143,7 +143,7 @@ def create_thumbnail(file_path: Path, size=(220, 300)) -> Image.Image | None:
             cache_file.unlink(missing_ok=True)
             cache_file.with_suffix('.noimg').unlink(missing_ok=True)
 
-    if file_path.suffix.lower() in ('.zip', '.rar', '.cbz', '.cbr'):
+    if file_path.suffix.lower() in ('.zip', '.rar', '.cbz', '.cbr', '.7z', '.cb7', '.pdf'):
         img = get_cover_from_archive(file_path)
     else:
         img = safe_open_image_from_path(file_path)
