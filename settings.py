@@ -22,7 +22,6 @@ DEFAULTS = {
     "thumbnail_height":       150,   # サムネイル高さ px (80-400)
     "scrollbar_always":       False,
     "show_hierarchy":         True,
-    "show_filepath":          True,
     "remember_last_location": True,
     "viewer_mode":              "inline",
     "page_cache_mb":            500,   # ページキャッシュ容量上限 (MB)
@@ -33,6 +32,43 @@ DEFAULTS = {
     "slideshow_end_action":     "stop",   # 最後に達したときの動作: "stop"/"first"/"next_book"
     "slideshow_effect":         "none",   # ページ切り替え効果: "none"/"slide_in"/"slide_out"/"dissolve"
     "slideshow_effect_duration": 1.0,  # ページ切り替えアニメーション長さ (秒)
+    # ---- Phase 3 ----
+    "auto_split_spread":        True,      # 横長ページを2ページに自動分割
+    "margin_autocrop":          False,     # スキャン余白の自動カット
+    "filter_brightness":        100,       # 明るさ % (50-150, 100=補正なし)
+    "filter_grayscale":         False,     # グレースケール表示
+    "viewer_bg_color":          "#1a1a1a", # ビューア背景色
+    # ---- Phase 4 ----
+    "keymap":                   {},        # キー割り当ての上書き {アクション名: [キー名, ...]}
+    "mouse_gestures":           True,      # ビューアの右ドラッグジェスチャー
+    # ---- 本棚の表示 ----
+    "shelf_sort":               "name",    # 並び順: "name"=名前順 / "added"=追加日順 / "recent"=最終閲覧順
+    "read_filter":              "all",     # フィルター: "all"/"unread"/"reading"/"done"
+    "series_grouping":          False,     # シリーズ自動グループ化
+}
+
+# ビューアのキー割り当てデフォルト（viewer.py が参照。Escは固定なので含まない）
+DEFAULT_KEYMAP = {
+    "next_page":  ["Right", "D", "Space"],
+    "prev_page":  ["Left", "A"],
+    "zoom_in":    ["+", "="],
+    "zoom_out":   ["-", "_"],
+    "fit_mode":   ["F"],
+    "fullscreen": ["F11"],
+    "loupe":      ["L"],
+    "layout":     ["V"],
+}
+
+# 設定ダイアログでの表示順とi18nキーの対応
+_KEYMAP_I18N = {
+    "next_page":  "keymap_next",
+    "prev_page":  "keymap_prev",
+    "zoom_in":    "keymap_zoom_in",
+    "zoom_out":   "keymap_zoom_out",
+    "fit_mode":   "keymap_fit",
+    "fullscreen": "keymap_fullscreen",
+    "loupe":      "keymap_loupe",
+    "layout":     "keymap_layout",
 }
 
 
@@ -184,7 +220,6 @@ class SettingsDialog(QDialog):
         # ---- 表示設定（トグル群） ----
         self._toggle_row(layout, tr("tog_scrollbar"), "tog_scrollbar")
         self._toggle_row(layout, tr("tog_hierarchy"), "tog_hierarchy")
-        self._toggle_row(layout, tr("tog_filepath"),  "tog_filepath")
         self._toggle_row(layout, tr("tog_remember"),  "tog_remember")
 
         layout.addWidget(self._divider())
@@ -293,7 +328,6 @@ class SettingsDialog(QDialog):
         self.spin_thumb_h.setValue(self.settings["thumbnail_height"])
         self.tog_scrollbar.setChecked(self.settings["scrollbar_always"])
         self.tog_hierarchy.setChecked(self.settings["show_hierarchy"])
-        self.tog_filepath.setChecked(self.settings["show_filepath"])
         self.tog_remember.setChecked(self.settings["remember_last_location"])
         self.spin_page_cache.setValue(self.settings.get("page_cache_mb", 500))
         if self.settings["viewer_mode"] == "inline":
@@ -302,8 +336,7 @@ class SettingsDialog(QDialog):
             self.radio_window.setChecked(True)
         lang_map = {"ja": 0, "en": 1}
         self.combo_lang.setCurrentIndex(lang_map.get(self.settings.get("language", "ja"), 0))
-        for tog in [self.tog_scrollbar, self.tog_hierarchy, self.tog_filepath,
-                    self.tog_remember]:
+        for tog in [self.tog_scrollbar, self.tog_hierarchy, self.tog_remember]:
             tog._update_style()
 
     def _save_and_close(self):
@@ -311,7 +344,6 @@ class SettingsDialog(QDialog):
         self.settings["thumbnail_height"]       = self.spin_thumb_h.value()
         self.settings["scrollbar_always"]       = self.tog_scrollbar.isChecked()
         self.settings["show_hierarchy"]         = self.tog_hierarchy.isChecked()
-        self.settings["show_filepath"]          = self.tog_filepath.isChecked()
         self.settings["remember_last_location"] = self.tog_remember.isChecked()
         self.settings["viewer_mode"]            = "inline" if self.radio_inline.isChecked() else "window"
         self.settings["page_cache_mb"]          = self.spin_page_cache.value()

@@ -12,7 +12,7 @@ a = Analysis(
     hiddenimports=[
         # ローカルモジュール（import chainで拾われない場合の保険）
         'archive', 'core', 'viewer', 'settings', 'i18n', 'utils',
-        'page_cache', 'wood_bg', 'appdir',
+        'page_cache', 'wood_bg', 'appdir', 'help_docs',
         # PySide6: 動的ロードされるモジュール
         'PySide6.QtSvg',
         'PySide6.QtXml',

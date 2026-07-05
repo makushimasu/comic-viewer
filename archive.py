@@ -178,30 +178,6 @@ def _open_libarchive(file_path: Path, rar_version: int = 0):
     return a
 
 
-def _scan_names(a) -> list[str]:
-    """アーカイブ内の画像ファイル名を全走査して返す（データは読まない）"""
-    names = []
-    entry = ctypes.c_void_p()
-    fatal_count = 0
-    while True:
-        r = _lib.archive_read_next_header(a, ctypes.byref(entry))
-        if r == ARCHIVE_EOF:
-            break
-        if r == ARCHIVE_FATAL:
-            fatal_count += 1
-            if fatal_count >= 5:
-                break
-            continue
-        if r == ARCHIVE_FAILED:
-            continue
-        fatal_count = 0
-        name = _entry_name(entry)
-        if name and name.lower().endswith(IMAGE_EXTS) and not name.endswith('/'):
-            names.append(name)
-        _lib.archive_read_data_skip(a)
-    return names
-
-
 def _read_all_data(a) -> list[tuple[str, bytes]]:
     """アーカイブ内の全画像（およびPDF）をデータごと読む"""
     collected = []
@@ -234,11 +210,6 @@ def _read_all_data(a) -> list[tuple[str, bytes]]:
 # ============================================================
 # libarchive で RAR を読む（RAR4/5 を判別して専用パーサ使用）
 # ============================================================
-
-def _read_rar_libarchive_all(file_path: Path) -> list[bytes] | None:
-    pages, _ = _read_rar_libarchive_all_with_names(file_path)
-    return pages if pages else None
-
 
 def _read_rar_libarchive_all_with_names(file_path: Path) -> tuple[list[bytes], list[str]]:
     """libarchiveで全画像とファイル名を読む"""
@@ -466,11 +437,6 @@ def _read_rar_via_command(file_path: Path) -> list[bytes]:
 # ============================================================
 # ZIP（標準ライブラリ）
 # ============================================================
-
-def _read_zip_all(file_path: Path) -> list[bytes]:
-    pages, _ = _read_zip_all_with_names(file_path)
-    return pages
-
 
 def read_zip_streaming(file_path: Path):
     """
@@ -756,12 +722,6 @@ def _pdf_bytes_cover(data: bytes) -> bytes | None:
 # ============================================================
 # 公開 API
 # ============================================================
-
-def read_all_images(file_path: Path) -> list[bytes]:
-    """アーカイブ内の全画像を返す（ソート済み）"""
-    pages, _ = read_all_images_with_names(file_path)
-    return pages
-
 
 def read_all_images_with_names(file_path: Path) -> tuple[list[bytes], list[str]]:
     """アーカイブ内の全画像とファイル名を返す（ソート済み）"""

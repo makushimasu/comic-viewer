@@ -13,6 +13,27 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QAction, QIcon, QFont, QColor
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QObject
 
+# ============================================================
+# キー割り当て（settings.json の "keymap" で上書き可能）
+# ============================================================
+
+from settings import DEFAULT_KEYMAP
+
+
+def resolve_keymap(settings: dict) -> dict:
+    """settings の keymap でデフォルトを上書きし、キー名→アクション名の逆引き辞書を返す。"""
+    merged = dict(DEFAULT_KEYMAP)
+    user = settings.get("keymap", {})
+    if isinstance(user, dict):
+        for action, keys in user.items():
+            if action in merged and isinstance(keys, list) and keys:
+                merged[action] = [str(k) for k in keys]
+    reverse = {}
+    for action, keys in merged.items():
+        for k in keys:
+            reverse[k.strip().lower()] = action
+    return reverse
+
 from core import safe_open_image, safe_open_image_from_path
 from i18n import tr
 
@@ -444,6 +465,18 @@ class ViewerWindow(QMainWindow):
         self._anim_group = None        # 実行中のアニメーショングループ
         self._anim_labels = []         # アニメーション用オーバーレイラベル
 
+        # ---- Phase 3/4 ----
+        self._split_half = 0            # 横長ページ分割時に表示する半分 (0=1つ目, 1=2つ目, -1=後半から)
+        self._current_is_split = False  # 現在ページが分割表示中か
+        self._spread_count = 1          # 2ページモードで現在の画面に表示している物理ページ数
+        self._keymap = resolve_keymap(self._viewer_settings)
+        self._loupe_active = False
+        self._view_layout = "paged"     # "paged" | "vertical"
+        self._vpage_labels: list = []   # 縦スクロールモードのページラベル
+        self._vloaded: set = set()      # 縦スクロールモードでPixmapロード済みのindex
+        self._bg_color = str(self._viewer_settings.get("viewer_bg_color", "#1a1a1a"))
+        self._gesture_start = None      # 右ドラッグジェスチャーの開始点
+
         self._build_ui()
         self._start_page_load()   # ← 非同期でページ読み込み開始
 
@@ -502,6 +535,9 @@ class ViewerWindow(QMainWindow):
     def _on_load_done(self, pages: list, page_type: str, initial_index: int, page_names: list):
         """ページリスト構築完了 → 全ページ確定"""
         self._streaming_done = True
+        # ストリーミング途中で縦スクロールに切り替えていた場合はページ数が確定したので再構築
+        if self._view_layout == "vertical":
+            self._exit_vertical_mode()
         current = self.current_index  # ストリーミング中に移動したページを保持
         self.pages = pages
         self._page_type = page_type
@@ -553,15 +589,15 @@ class ViewerWindow(QMainWindow):
         self.loading_label = loading_widget
         central.addWidget(loading_widget)         # index 0
 
-        # 画像表示
+        # 画像表示（背景色は設定から）
         self.scroll_area = QScrollArea()
         self.scroll_area.setFocusPolicy(Qt.NoFocus)
         self.scroll_area.setAlignment(Qt.AlignCenter)
-        self.scroll_area.setStyleSheet("background: #1a1a1a; border: none;")
+        self.scroll_area.setStyleSheet(f"background: {self._bg_color}; border: none;")
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.image_label.setStyleSheet("background: #1a1a1a;")
+        self.image_label.setStyleSheet(f"background: {self._bg_color};")
         self.scroll_area.setWidget(self.image_label)
         self.scroll_area.setWidgetResizable(True)
         central.addWidget(self.scroll_area)       # index 1
@@ -569,6 +605,16 @@ class ViewerWindow(QMainWindow):
         # scroll_area上の右クリックも検知できるようイベントフィルタを設定
         self.scroll_area.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
+
+        # ルーペ（Lキーでトグル、マウス追従で原寸表示）
+        self.image_label.setMouseTracking(True)
+        self.scroll_area.viewport().setMouseTracking(True)
+        self._loupe_label = QLabel(central)
+        self._loupe_label.setFixedSize(280, 280)
+        self._loupe_label.setStyleSheet(
+            "background: #111; border: 2px solid #e8b84a; border-radius: 6px;")
+        self._loupe_label.setAlignment(Qt.AlignCenter)
+        self._loupe_label.hide()
 
         # ---- オーバーレイパネル（右クリックで表示/非表示） ----
         self._overlay_visible = False
@@ -641,6 +687,7 @@ class ViewerWindow(QMainWindow):
             "book-open":   _circled('<path d="M2 4h7a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H2z"/><path d="M22 4h-7a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h7z"/>'),
             "flip-horizontal": _circled('<path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="2" x2="12" y2="22" stroke-dasharray="3 3"/>'),
             "more":        '<circle cx="12" cy="12" r="10"/><path d="M16.5 12h.01"/><path d="M12 12h.01"/><path d="M7.5 12h.01"/>',
+            "vertical":    _circled('<path d="M12 3v18"/><path d="m8 7 4-4 4 4"/><path d="m8 17 4 4 4-4"/>'),
         }
 
         def _lucide_icon(key: str, color: str = "#1a1a1a") -> QIcon:
@@ -710,6 +757,7 @@ class ViewerWindow(QMainWindow):
 
         top_layout.addStretch()
 
+        top_layout.addWidget(_mk_top_btn("help", tr("top_btn_help"), self._show_help))
         top_layout.addWidget(_mk_top_btn("settings", tr("top_btn_settings"), self.show_viewer_settings))
 
         self.top_overlay.setVisible(False)
@@ -777,6 +825,12 @@ class ViewerWindow(QMainWindow):
             self._toggle_reading_direction,
         )
         bottom_layout.addWidget(self.btn_reading_dir)
+        self.btn_layout = _mk_bottom_btn(
+            "vertical",
+            tr("btn_layout_vertical"),
+            self._toggle_view_layout,
+        )
+        bottom_layout.addWidget(self.btn_layout)
 
         bottom_outer.addWidget(btn_row)
 
@@ -1252,11 +1306,7 @@ class ViewerWindow(QMainWindow):
         self._refresh_thumb_cell(index)
 
     def _goto_page_from_thumb(self, index: int):
-        if 0 <= index < len(self.pages):
-            self.current_index = index
-            self.zoom = 1.0
-            self._show_page()
-            self._update_thumb_highlight()
+        self._jump_to_page(index)
 
     def _apply_thumb_highlight_styles(self):
         """各サムネイルセルにハイライト色を適用する（スクロールは行わない）"""
@@ -1285,6 +1335,44 @@ class ViewerWindow(QMainWindow):
         if self._page_list_visible:
             self._scroll_page_list_to_current()
 
+    def _process_page_image(self, img):
+        """PIL Imageに余白カット・明るさ・グレースケールの各補正を適用する"""
+        s = self._viewer_settings
+        # 余白自動カット
+        if s.get("margin_autocrop", False):
+            try:
+                gray = img.convert("L")
+                # ほぼ白(235以上)を背景とみなして非白領域のbboxを取る
+                mask = gray.point(lambda v: 255 if v < 235 else 0)
+                bbox = mask.getbbox()
+                if bbox:
+                    # 少し余白を残す（見た目のクッション）
+                    pad = max(4, int(min(img.size) * 0.01))
+                    left   = max(0, bbox[0] - pad)
+                    top    = max(0, bbox[1] - pad)
+                    right  = min(img.width,  bbox[2] + pad)
+                    bottom = min(img.height, bbox[3] + pad)
+                    # ほぼ全面が白いページ等でカットしすぎないようガード（面積30%未満は無視）
+                    if (right - left) * (bottom - top) >= img.width * img.height * 0.30:
+                        img = img.crop((left, top, right, bottom))
+            except Exception:
+                pass
+        # 明るさ補正
+        try:
+            b = int(s.get("filter_brightness", 100))
+            if b != 100:
+                from PIL import ImageEnhance
+                img = ImageEnhance.Brightness(img).enhance(max(0.5, min(1.5, b / 100.0)))
+        except Exception:
+            pass
+        # グレースケール
+        if s.get("filter_grayscale", False):
+            try:
+                img = img.convert("L").convert("RGB")
+            except Exception:
+                pass
+        return img
+
     def _get_pixmap(self, index: int) -> QPixmap | None:
         if not self.pages or not (0 <= index < len(self.pages)):
             return None
@@ -1298,6 +1386,7 @@ class ViewerWindow(QMainWindow):
                 img = safe_open_image_from_path(item) # Path（画像フォルダ）
             if img is None:
                 return None
+            img = self._process_page_image(img)
             pix = pil_to_qpixmap(img)
             angle = self._page_rotations.get(index, 0)
             if angle:
@@ -1308,7 +1397,18 @@ class ViewerWindow(QMainWindow):
             print(f"ページ読み込みエラー index={index}: {e}")
             return None
 
+    SPLIT_RATIO = 1.15  # 幅が高さの1.15倍を超えたら見開きスキャンとみなす
+
+    def _is_wide(self, pix) -> bool:
+        """横長（見開きスキャン）画像かどうか"""
+        return (pix is not None and not pix.isNull()
+                and pix.height() > 0
+                and pix.width() > pix.height() * self.SPLIT_RATIO)
+
     def _show_page(self):
+        if self._view_layout == "vertical":
+            return  # 縦スクロールモードでは個別ページ表示は行わない
+
         if not self.pages:
             self.image_label.setText(tr("no_images"))
             return
@@ -1318,11 +1418,42 @@ class ViewerWindow(QMainWindow):
             self.image_label.setText(tr("img_load_error"))
             return
 
+        # 横長ページの自動分割（1ページ表示モードのみ）
+        self._current_is_split = False
+        if (self.pages_per_screen == 1
+                and self._viewer_settings.get("auto_split_spread", True)
+                and pixmap.height() > 0
+                and pixmap.width() > pixmap.height() * self.SPLIT_RATIO):
+            self._current_is_split = True
+            if self._split_half == -1:   # 前ページから戻ってきた場合は後半から
+                self._split_half = 1
+            half = 1 if self._split_half == 1 else 0
+            # 読み方向: 右綴じ(rtl)なら右半分が先
+            rtl = self._viewer_settings.get("reading_direction", "rtl") == "rtl"
+            w2 = pixmap.width() // 2
+            from PySide6.QtCore import QRect
+            if (half == 0) == rtl:
+                pixmap = pixmap.copy(QRect(pixmap.width() - w2, 0, w2, pixmap.height()))
+            else:
+                pixmap = pixmap.copy(QRect(0, 0, w2, pixmap.height()))
+        else:
+            if self._split_half == -1:
+                self._split_half = 0
+
         # 2ページ見開き表示: current_index(右) + current_index+1(左) を横に合成
-        if self.pages_per_screen == 2 and self.current_index + 1 < len(self.pages):
-            next_pix = self._get_pixmap(self.current_index + 1)
-            if next_pix is not None and not next_pix.isNull():
-                pixmap = self._compose_spread(pixmap, next_pix)
+        # ただし横長ページ（見開きスキャン）は単独で全幅表示する（自動分割設定ON時）
+        self._spread_count = 1
+        if self.pages_per_screen == 2:
+            split_on = self._viewer_settings.get("auto_split_spread", True)
+            cur_wide = split_on and self._is_wide(pixmap)
+            if not cur_wide and self.current_index + 1 < len(self.pages):
+                next_pix = self._get_pixmap(self.current_index + 1)
+                if next_pix is not None and not next_pix.isNull():
+                    if split_on and self._is_wide(next_pix):
+                        pass  # 相手が横長 → 現在ページのみ表示（横長は次の画面で単独表示）
+                    else:
+                        pixmap = self._compose_spread(pixmap, next_pix)
+                        self._spread_count = 2
 
         self._original_pixmap = pixmap
         self._apply_display()
@@ -1399,10 +1530,22 @@ class ViewerWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def next_page(self):
+        # 縦スクロールモード: 1画面分スクロール
+        if self._view_layout == "vertical":
+            sb = self.scroll_area.verticalScrollBar()
+            sb.setValue(sb.value() + int(self.scroll_area.viewport().height() * 0.9))
+            return
+        # 分割表示中で前半を表示している → 同じページの後半へ
+        if self._current_is_split and self._split_half == 0:
+            self._split_half = 1
+            self._show_page()
+            return
         # ストリーミング中は届いているページ数 or 全体の最大まで進める
-        step = self.pages_per_screen
+        # 2ページモードでは直前の画面に実際に表示した枚数(1 or 2)だけ進める
+        step = self._spread_count if self.pages_per_screen == 2 else 1
         max_index = len(self.pages) - 1
         if self.current_index < max_index:
+            self._split_half = 0
             self.current_index = min(self.current_index + step, max_index)
             self.zoom = 1.0
             # ページデータが届いていれば表示、まだなら待機（_on_page_readyで表示される）
@@ -1413,12 +1556,56 @@ class ViewerWindow(QMainWindow):
             self._update_thumb_highlight()
 
     def prev_page(self):
-        step = self.pages_per_screen
-        if self.current_index > 0:
-            self.current_index = max(self.current_index - step, 0)
+        # 縦スクロールモード: 1画面分戻る
+        if self._view_layout == "vertical":
+            sb = self.scroll_area.verticalScrollBar()
+            sb.setValue(sb.value() - int(self.scroll_area.viewport().height() * 0.9))
+            return
+        # 分割表示中で後半を表示している → 同じページの前半へ
+        if self._current_is_split and self._split_half == 1:
+            self._split_half = 0
+            self._show_page()
+            return
+        if self.current_index <= 0:
+            return
+        # 2ページモード: 1つ前の画面の先頭ページを求める
+        # （直前ページが横長なら単独画面、そうでなければ2ページペアの先頭へ）
+        if self.pages_per_screen == 2:
+            j = self.current_index - 1
+            if j >= 1:
+                if self._viewer_settings.get("auto_split_spread", True):
+                    pj = self._get_pixmap(j)
+                    if not self._is_wide(pj):
+                        pj1 = self._get_pixmap(j - 1)
+                        if not self._is_wide(pj1):
+                            j -= 1  # (j-1, j) のペア画面
+                else:
+                    j -= 1  # 従来動作: 常に2ページ戻る
+            self._split_half = 0
+            self.current_index = j
             self.zoom = 1.0
             self._show_page()
             self._update_thumb_highlight()
+            return
+        self._split_half = -1  # 前ページが分割対象なら後半から表示する
+        self.current_index = self.current_index - 1
+        self.zoom = 1.0
+        self._show_page()
+        self._update_thumb_highlight()
+
+    def _jump_to_page(self, index: int):
+        """指定ページへジャンプする（分割状態リセット・縦スクロール対応の共通処理）"""
+        if not (0 <= index < len(self.pages)):
+            return
+        self._split_half = 0
+        self.current_index = index
+        if self._view_layout == "vertical":
+            self._scroll_to_vpage(index)
+            self._update_status()
+            return
+        self.zoom = 1.0
+        self._show_page()
+        self._update_thumb_highlight()
 
     def zoom_in(self):
         self.zoom = min(self.zoom * 1.25, 8.0)
@@ -1873,18 +2060,12 @@ class ViewerWindow(QMainWindow):
     def goto_first_page(self):
         """先頭ページへ移動"""
         if self.pages:
-            self.current_index = 0
-            self.zoom = 1.0
-            self._show_page()
-            self._update_thumb_highlight()
+            self._jump_to_page(0)
 
     def goto_last_page(self):
         """最後のページへ移動"""
         if self.pages:
-            self.current_index = len(self.pages) - 1
-            self.zoom = 1.0
-            self._show_page()
-            self._update_thumb_highlight()
+            self._jump_to_page(len(self.pages) - 1)
 
     def _show_goto_page_dialog(self):
         """ページ番号を指定して移動するダイアログ"""
@@ -1898,10 +2079,7 @@ class ViewerWindow(QMainWindow):
             self.current_index + 1, 1, total, 1
         )
         if ok:
-            self.current_index = page - 1
-            self.zoom = 1.0
-            self._show_page()
-            self._update_thumb_highlight()
+            self._jump_to_page(page - 1)
 
     def _toggle_page_list(self):
         """「ページ」ボタン: 左側のページ一覧パネルをトグル表示"""
@@ -1959,11 +2137,7 @@ class ViewerWindow(QMainWindow):
         index = item.data(Qt.UserRole)
         if index is None:
             return
-        if 0 <= index < len(self.pages):
-            self.current_index = index
-            self.zoom = 1.0
-            self._show_page()
-            self._update_thumb_highlight()
+        self._jump_to_page(index)
 
     def _build_page_list(self):
         """ページ一覧を構築する（1ページ目が先頭）"""
@@ -1982,10 +2156,7 @@ class ViewerWindow(QMainWindow):
         """ページ一覧の項目クリックで該当ページへ移動"""
         index = self.page_list_widget.row(item)
         if 0 <= index < len(self.pages):
-            self.current_index = index
-            self.zoom = 1.0
-            self._show_page()
-            self._update_thumb_highlight()
+            self._jump_to_page(index)
             self._highlight_page_list_current()
 
     def _highlight_page_list_current(self):
@@ -2011,6 +2182,168 @@ class ViewerWindow(QMainWindow):
         save_settings(s)
         self.btn_reading_dir.setText(tr("reading_rtl") if new_dir == "rtl" else tr("reading_ltr"))
         self._build_thumbnail_strip()
+
+    # ------------------------------------------------------------------ #
+    # ルーペ
+    # ------------------------------------------------------------------ #
+
+    def _toggle_loupe(self):
+        """ルーペのON/OFF切替（マウス移動で _update_loupe が呼ばれる）"""
+        self._loupe_active = not self._loupe_active
+        if not self._loupe_active:
+            self._loupe_label.hide()
+
+    def _update_loupe(self, viewport_pos):
+        """カーソル位置周辺を原寸で切り出してルーペラベルに表示する"""
+        if not self._loupe_active or self._original_pixmap is None:
+            self._loupe_label.hide()
+            return
+        if self._view_layout == "vertical":
+            self._loupe_label.hide()
+            return
+        disp = self.image_label.pixmap()
+        if disp is None or disp.isNull():
+            self._loupe_label.hide()
+            return
+        # viewport座標 → image_label内の表示画像座標
+        lbl_pos = self.image_label.mapFrom(self.scroll_area.viewport(), viewport_pos)
+        off_x = (self.image_label.width() - disp.width()) / 2
+        off_y = (self.image_label.height() - disp.height()) / 2
+        px = lbl_pos.x() - off_x
+        py = lbl_pos.y() - off_y
+        if not (0 <= px < disp.width() and 0 <= py < disp.height()):
+            self._loupe_label.hide()
+            return
+        # 元画像上の対応点を中心に280x280を原寸で切り出す
+        orig = self._original_pixmap
+        size = 280
+        ox = int(px / disp.width() * orig.width()) - size // 2
+        oy = int(py / disp.height() * orig.height()) - size // 2
+        ox = max(0, min(ox, max(0, orig.width() - size)))
+        oy = max(0, min(oy, max(0, orig.height() - size)))
+        from PySide6.QtCore import QRect
+        region = orig.copy(QRect(ox, oy, min(size, orig.width()), min(size, orig.height())))
+        self._loupe_label.setPixmap(region)
+        # カーソルの右下に表示（端に達したら反対側へフリップ）
+        central = self._central_stack
+        gpos = self.scroll_area.viewport().mapTo(central, viewport_pos)
+        x = gpos.x() + 24
+        y = gpos.y() + 24
+        if x + size > central.width():
+            x = gpos.x() - size - 24
+        if y + size > central.height():
+            y = gpos.y() - size - 24
+        self._loupe_label.move(max(0, x), max(0, y))
+        self._loupe_label.show()
+        self._loupe_label.raise_()
+
+    # ------------------------------------------------------------------ #
+    # 縦スクロール（ウェブトゥーン）モード
+    # ------------------------------------------------------------------ #
+
+    def _toggle_view_layout(self):
+        """ページ送り ⇔ 縦スクロールを切り替える"""
+        if self._view_layout == "paged":
+            self._enter_vertical_mode()
+        else:
+            self._exit_vertical_mode()
+
+    def _enter_vertical_mode(self):
+        if not self.pages or self._view_layout == "vertical":
+            return
+        from PySide6.QtWidgets import QWidget as _QW, QVBoxLayout as _QVB
+        self._view_layout = "vertical"
+        self.btn_layout.setText(tr("btn_layout_paged"))
+        self._loupe_label.hide()
+        # image_labelを退避して縦並びコンテナに差し替える
+        self.scroll_area.takeWidget()
+        self._vcontainer = _QW()
+        self._vcontainer.setStyleSheet(f"background: {self._bg_color};")
+        vlay = _QVB(self._vcontainer)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(6)
+        self._vpage_labels = []
+        self._vloaded = set()
+        default_h = max(200, int(self.scroll_area.viewport().width() * 1.42))
+        for _ in range(len(self.pages)):
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setFixedHeight(default_h)
+            lbl.setStyleSheet("background: transparent;")
+            vlay.addWidget(lbl)
+            self._vpage_labels.append(lbl)
+        self.scroll_area.setWidget(self._vcontainer)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_vertical_scroll)
+        from PySide6.QtCore import QTimer as _QT
+        _QT.singleShot(50, lambda: (
+            self._scroll_to_vpage(self.current_index),
+            self._update_vertical_window(),
+        ))
+
+    def _exit_vertical_mode(self):
+        if self._view_layout != "vertical":
+            return
+        self._view_layout = "paged"
+        self.btn_layout.setText(tr("btn_layout_vertical"))
+        try:
+            self.scroll_area.verticalScrollBar().valueChanged.disconnect(self._on_vertical_scroll)
+        except (RuntimeError, TypeError):
+            pass
+        w = self.scroll_area.takeWidget()
+        if w is not None and w is not self.image_label:
+            w.deleteLater()
+        self._vpage_labels = []
+        self._vloaded = set()
+        self.scroll_area.setWidget(self.image_label)
+        self.scroll_area.setWidgetResizable(True)
+        self.image_label.show()
+        self.zoom = 1.0
+        self._split_half = 0
+        self._show_page()
+
+    def _scroll_to_vpage(self, index: int):
+        if self._view_layout != "vertical" or not (0 <= index < len(self._vpage_labels)):
+            return
+        self.scroll_area.verticalScrollBar().setValue(self._vpage_labels[index].y())
+        self._update_vertical_window()
+
+    def _on_vertical_scroll(self, _value: int):
+        self._update_vertical_window()
+
+    def _update_vertical_window(self):
+        """縦スクロール: 可視範囲±2画面分だけPixmapをロードし、範囲外は解放する"""
+        if self._view_layout != "vertical" or not self._vpage_labels:
+            return
+        vp = self.scroll_area.viewport()
+        y = self.scroll_area.verticalScrollBar().value()
+        vh = vp.height()
+        vw = max(100, vp.width() - 4)
+        top_visible = None
+        for i, lbl in enumerate(self._vpage_labels):
+            ly = lbl.y()
+            lh = lbl.height()
+            near = (ly + lh >= y - vh * 2) and (ly <= y + vh * 3)
+            if near and i not in self._vloaded:
+                pix = self._get_pixmap(i)
+                if pix and not pix.isNull():
+                    scaled = pix.scaledToWidth(vw, Qt.SmoothTransformation)
+                    lbl.setFixedHeight(scaled.height())
+                    lbl.setPixmap(scaled)
+                    self._vloaded.add(i)
+            elif not near and i in self._vloaded:
+                lbl.setPixmap(QPixmap())
+                self._vloaded.discard(i)
+            if top_visible is None and ly + lh > y:
+                top_visible = i
+        if top_visible is not None and top_visible != self.current_index:
+            self.current_index = top_visible
+            self._update_status()
+
+    def _show_help(self):
+        """ビューアモードのヘルプを表示"""
+        from help_docs import show_help_dialog
+        show_help_dialog(self, "viewer")
 
     def show_viewer_settings(self):
         """ビューア設定ダイアログ"""
@@ -2072,6 +2405,107 @@ class ViewerWindow(QMainWindow):
         radio_row.addStretch()
         layout.addLayout(radio_row)
 
+        # --- 表示補正（Phase 3） ---
+        from PySide6.QtWidgets import QCheckBox, QSpinBox, QComboBox
+        s = load_settings()
+
+        chk_split = QCheckBox(tr("vs_split_label"))
+        chk_split.setChecked(bool(s.get("auto_split_spread", True)))
+        chk_split.setStyleSheet("color: #3a2000; background: transparent; padding: 2px;")
+        layout.addWidget(chk_split)
+
+        chk_crop = QCheckBox(tr("vs_autocrop_label"))
+        chk_crop.setChecked(bool(s.get("margin_autocrop", False)))
+        chk_crop.setStyleSheet("color: #3a2000; background: transparent; padding: 2px;")
+        layout.addWidget(chk_crop)
+
+        chk_gray = QCheckBox(tr("vs_grayscale_label"))
+        chk_gray.setChecked(bool(s.get("filter_grayscale", False)))
+        chk_gray.setStyleSheet("color: #3a2000; background: transparent; padding: 2px;")
+        layout.addWidget(chk_gray)
+
+        _input_style = """
+            QSpinBox, QComboBox {
+                background: white; color: #1a1a1a;
+                border: 1px solid #aaa; border-radius: 3px;
+                padding: 3px 8px;
+            }
+            QComboBox QAbstractItemView {
+                background: white; color: #1a1a1a;
+                selection-background-color: #e8d5b5;
+                selection-color: #1a1a1a;
+            }
+        """
+
+        row_bright = QHBoxLayout()
+        lbl_bright = QLabel(tr("vs_brightness_label"))
+        spin_bright = QSpinBox()
+        spin_bright.setRange(50, 150)
+        spin_bright.setSuffix(" %")
+        spin_bright.setValue(int(s.get("filter_brightness", 100)))
+        spin_bright.setFixedWidth(90)
+        spin_bright.setStyleSheet(_input_style)
+        row_bright.addWidget(lbl_bright)
+        row_bright.addWidget(spin_bright)
+        row_bright.addStretch()
+        layout.addLayout(row_bright)
+
+        row_bg = QHBoxLayout()
+        lbl_bg = QLabel(tr("vs_bg_label"))
+        combo_bg = QComboBox()
+        _bg_presets = [
+            (tr("vs_bg_black"),    "#1a1a1a"),
+            (tr("vs_bg_darkgray"), "#333333"),
+            (tr("vs_bg_gray"),     "#777777"),
+            (tr("vs_bg_white"),    "#f5f5f5"),
+            (tr("vs_bg_sepia"),    "#f4ecd8"),
+        ]
+        for name, _hex in _bg_presets:
+            combo_bg.addItem(name, _hex)
+        cur_bg = s.get("viewer_bg_color", "#1a1a1a")
+        for i, (_, _hex) in enumerate(_bg_presets):
+            if _hex == cur_bg:
+                combo_bg.setCurrentIndex(i)
+                break
+        combo_bg.setFixedWidth(140)
+        combo_bg.setStyleSheet(_input_style)
+        row_bg.addWidget(lbl_bg)
+        row_bg.addWidget(combo_bg)
+        row_bg.addStretch()
+        layout.addLayout(row_bg)
+
+        # --- キー割り当て（本棚設定から移設） ---
+        from PySide6.QtWidgets import QLineEdit, QGridLayout, QFrame
+        from settings import DEFAULT_KEYMAP, _KEYMAP_I18N
+        _div = QFrame()
+        _div.setFrameShape(QFrame.HLine)
+        _div.setStyleSheet("color: #ddccbb;")
+        layout.addWidget(_div)
+
+        km_label = QLabel(tr("keymap_label"))
+        km_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(km_label)
+        km_note = QLabel(tr("keymap_note"))
+        km_note.setStyleSheet("color: #8a7050; font-size: 9pt; background: transparent;")
+        layout.addWidget(km_note)
+
+        km_grid = QGridLayout()
+        km_grid.setHorizontalSpacing(8)
+        km_grid.setVerticalSpacing(4)
+        keymap_edits = {}
+        user_km = s.get("keymap", {}) or {}
+        for r, action in enumerate(_KEYMAP_I18N):
+            lab = QLabel(tr(_KEYMAP_I18N[action]))
+            cur = user_km.get(action) or DEFAULT_KEYMAP[action]
+            edit = QLineEdit(", ".join(cur))
+            edit.setFixedWidth(220)
+            edit.setStyleSheet(_input_style)
+            km_grid.addWidget(lab, r, 0)
+            km_grid.addWidget(edit, r, 1)
+            keymap_edits[action] = edit
+        km_grid.setColumnStretch(2, 1)
+        layout.addLayout(km_grid)
+
         # --- OK/キャンセル ---
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -2084,15 +2518,40 @@ class ViewerWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         if dlg.exec() == QDialog.Accepted:
+            settings = load_settings()
             new_value = group.checkedId()
-            if new_value in (1, 2) and new_value != self.pages_per_screen:
+            if new_value in (1, 2):
                 self.pages_per_screen = new_value
-                # 設定ファイルに保存
-                settings = load_settings()
                 settings["pages_per_screen"] = new_value
-                save_settings(settings)
-                # 2ページモードで奇数indexにいる場合の表示も考慮しそのまま再表示
-                self.zoom = 1.0
+            settings["auto_split_spread"] = chk_split.isChecked()
+            settings["margin_autocrop"]   = chk_crop.isChecked()
+            settings["filter_grayscale"]  = chk_gray.isChecked()
+            settings["filter_brightness"] = spin_bright.value()
+            settings["viewer_bg_color"]   = combo_bg.currentData()
+            # キー割り当て: デフォルトと異なるものだけ保存（空欄はデフォルトに戻す）
+            from settings import DEFAULT_KEYMAP as _DKM
+            keymap = {}
+            for action, edit in keymap_edits.items():
+                keys = [k.strip() for k in edit.text().split(",") if k.strip()]
+                if keys and keys != _DKM[action]:
+                    keymap[action] = keys
+            settings["keymap"] = keymap
+            save_settings(settings)
+            # 表示に即反映
+            self._viewer_settings = settings
+            self._bg_color = settings["viewer_bg_color"]
+            # キーマップを即反映（キー名→アクションの逆引き辞書を再構築）
+            self._keymap = resolve_keymap(settings)
+            self.scroll_area.setStyleSheet(f"background: {self._bg_color}; border: none;")
+            self.image_label.setStyleSheet(f"background: {self._bg_color};")
+            self.zoom = 1.0
+            self._split_half = 0
+            if self._view_layout == "vertical":
+                self._vloaded = set()
+                if hasattr(self, "_vcontainer"):
+                    self._vcontainer.setStyleSheet(f"background: {self._bg_color};")
+                self._update_vertical_window()
+            else:
                 self._show_page()
 
 
@@ -2108,23 +2567,38 @@ class ViewerWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         key = event.key()
-        if key in (Qt.Key_Right, Qt.Key_D, Qt.Key_Space):
-            self.next_page()
-        elif key in (Qt.Key_Left, Qt.Key_A):
-            self.prev_page()
-        elif key in (Qt.Key_Plus, Qt.Key_Equal):
-            self.zoom_in()
-        elif key in (Qt.Key_Minus, Qt.Key_Underscore):
-            self.zoom_out()
-        elif key == Qt.Key_F:
-            self.cycle_fit_mode()
-        elif key == Qt.Key_Escape:
+        # Esc は固定割り当て（全画面解除 / 本棚へ戻る / 閉じる）
+        if key == Qt.Key_Escape:
             if self.window().isFullScreen():
                 self.toggle_fullscreen()
             elif self.parent() is not None:
                 self.back_to_shelf_requested.emit()
             else:
                 self.close()
+            return
+        # settings.json の keymap で上書き可能なアクションディスパッチ
+        from PySide6.QtGui import QKeySequence
+        try:
+            key_str = QKeySequence(key).toString().lower()
+        except Exception:
+            key_str = ""
+        action = self._keymap.get(key_str)
+        if action == "next_page":
+            self.next_page()
+        elif action == "prev_page":
+            self.prev_page()
+        elif action == "zoom_in":
+            self.zoom_in()
+        elif action == "zoom_out":
+            self.zoom_out()
+        elif action == "fit_mode":
+            self.cycle_fit_mode()
+        elif action == "fullscreen":
+            self.toggle_fullscreen()
+        elif action == "loupe":
+            self._toggle_loupe()
+        elif action == "layout":
+            self._toggle_view_layout()
         else:
             super().keyPressEvent(event)
 
@@ -2135,7 +2609,11 @@ class ViewerWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._original_pixmap:
+        if self._view_layout == "vertical" and self._vpage_labels:
+            # 幅が変わったので可視範囲を再スケール
+            self._vloaded = set()
+            self._update_vertical_window()
+        elif self._original_pixmap:
             self._apply_display()
         self._reposition_overlays()
 
@@ -2158,16 +2636,55 @@ class ViewerWindow(QMainWindow):
         self.bookmark_list_panel.setGeometry(0, top_h, panel_w, h - top_h - bottom_h)
         self.bookmark_list_panel.raise_()
 
+    GESTURE_THRESHOLD = 40  # これ以上動かしたらジェスチャーとみなす(px)
+
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
         if event.type() == QEvent.MouseButtonPress:
             if event.button() == Qt.RightButton:
-                self._toggle_overlay()
+                if self._viewer_settings.get("mouse_gestures", True):
+                    # ジェスチャー開始位置を記録（判定はリリース時）
+                    self._gesture_start = event.globalPosition().toPoint()
+                else:
+                    self._toggle_overlay()
                 return True
             if event.button() == Qt.LeftButton:
                 if self._handle_click_navigation(event.position().x()):
                     return True
+        elif event.type() == QEvent.MouseButtonRelease:
+            if event.button() == Qt.RightButton and self._gesture_start is not None:
+                delta = event.globalPosition().toPoint() - self._gesture_start
+                self._gesture_start = None
+                self._handle_gesture(delta.x(), delta.y())
+                return True
+        elif event.type() == QEvent.MouseMove and self._loupe_active:
+            vp = self.scroll_area.viewport()
+            if obj is vp:
+                self._update_loupe(event.position().toPoint())
+            elif obj is self.image_label:
+                self._update_loupe(
+                    self.image_label.mapTo(vp, event.position().toPoint()))
         return super().eventFilter(obj, event)
+
+    def _handle_gesture(self, dx: int, dy: int):
+        """右ドラッグジェスチャーの判定。動きが小さければメニュー表示。
+        ← 次のページ / → 前のページ / ↑ 全画面切替 / ↓ 本棚へ戻る"""
+        if max(abs(dx), abs(dy)) < self.GESTURE_THRESHOLD:
+            self._toggle_overlay()
+            return
+        if abs(dx) >= abs(dy):
+            if dx < 0:
+                self.next_page()
+            else:
+                self.prev_page()
+        else:
+            if dy < 0:
+                self.toggle_fullscreen()
+            else:
+                if self.parent() is not None:
+                    self.back_to_shelf_requested.emit()
+                else:
+                    self.close()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:

@@ -16,6 +16,12 @@ a = Analysis(
         'PySide6.QtGui',
         'PySide6.QtWidgets',
         'PySide6.QtXml',
+        'PySide6.QtSvg',
+        # ローカルモジュール（import chainで拾われない場合の保険）
+        'archive', 'core', 'viewer', 'settings', 'i18n', 'utils',
+        'page_cache', 'wood_bg', 'appdir', 'help_docs',
+        # PDF対応
+        'pypdfium2', 'pypdfium2_raw',
     ],
     hookspath=[],
     hooksconfig={},

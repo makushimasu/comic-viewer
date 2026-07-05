@@ -154,12 +154,6 @@ def save_cached_pages(file_path: Path, pages: list[bytes],
         shutil.rmtree(d, ignore_errors=True)
 
 
-def invalidate_cache(file_path: Path):
-    d = _cache_dir(file_path)
-    if d.exists():
-        shutil.rmtree(d, ignore_errors=True)
-
-
 def get_cache_size_mb() -> float:
     total = sum(
         f.stat().st_size

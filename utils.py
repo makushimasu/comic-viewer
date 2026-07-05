@@ -59,3 +59,36 @@ def parse_filename(filename: str, use_bracket_rule: bool = False) -> dict:
 
     # ブラケットルール不適用、またはマッチしない場合 → そのまま全部表示
     return {"title": stem, "full_stem": stem}
+
+
+# ============================================================
+# シリーズ自動グループ化
+# ============================================================
+
+# 巻数表現のパターン（シリーズ名の抽出用）
+_VOLUME_PATTERNS = [
+    re.compile(r'第?\s*\d+\s*[巻話章冊集]'),
+    re.compile(r'[vV][oO][lL]\.?\s*\d+'),
+    re.compile(r'\b[vV]\d+\b'),
+    re.compile(r'[\(（]\d+[\)）]'),
+    re.compile(r'[#＃]\d+'),
+    re.compile(r'[\s\-_～~・．.,、]*\d{1,4}\s*$'),   # 末尾の数字
+    re.compile(r'[\s(（]*[上中下前後][\s)）]*$'),      # 上巻/下巻表現
+]
+
+
+def series_display_title(title: str) -> str:
+    """タイトルから巻数表現を取り除いた表示用シリーズ名を返す"""
+    s = title
+    for pat in _VOLUME_PATTERNS:
+        s = pat.sub(' ', s)
+    s = re.sub(r'[\s\-_～~・，,、]+$', '', s.strip())
+    return s.strip() or title
+
+
+def series_key(title: str) -> str:
+    """シリーズ判定用の正規化キーを返す（巻数除去 + 空白/記号除去 + 小文字化）。
+    空文字が返る場合はグループ化しない。"""
+    s = series_display_title(title)
+    s = re.sub(r'[\s\-_～~・．.，,、!！?？'"'"']+', '', s).lower()
+    return s
