@@ -173,6 +173,9 @@ _TOOLBAR_SVG = {
     # 丸囲みの＋（本棚への追加）
     "add":      ('<circle cx="12" cy="12" r="10"/>'
                  '<path d="M12 8v8"/><path d="M8 12h8"/>'),
+    # 鉛筆（ファイル名変更）
+    "rename":   _circled('<path d="M12 20h9"/>'
+                         '<path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
     "folder_add": _circled('<path d="M12 10v6"/><path d="M9 13h6"/>'
                            '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9'
                            'A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
@@ -201,7 +204,7 @@ _IMAGE_SVG = (
 )
 
 
-def _render_svg_icon(svg: str, size: int = 64) -> QIcon | None:
+def _render_svg_icon(svg: str, size: int = 128) -> QIcon | None:
     """SVG文字列をQIconに変換する。QtSvgが使えない環境ではNone。"""
     try:
         from PySide6.QtSvg import QSvgRenderer
@@ -1186,7 +1189,6 @@ class BookshelfWindow(QMainWindow):
         self.current_folder = None
 
         self.create_toolbar()
-        self.create_menubar()
         self._build_central()
 
         # スクロールが止まった300ms後: ウィンドウを再計算してPixmapを入れ替える
@@ -1429,7 +1431,7 @@ class BookshelfWindow(QMainWindow):
 
     def create_toolbar(self):
         toolbar = QToolBar()
-        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setIconSize(QSize(32, 32))
         toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         toolbar.setContextMenuPolicy(Qt.PreventContextMenu)
         self.addToolBar(toolbar)
@@ -1468,6 +1470,10 @@ class BookshelfWindow(QMainWindow):
         stats_act.triggered.connect(self._show_stats)
         stats_act.setToolTip(tr("toolbar_stats_tip"))
 
+        rename_act = toolbar.addAction(toolbar_icon("rename"), tr("menu_rename"))
+        rename_act.triggered.connect(self.rename_selected)
+        rename_act.setToolTip(tr("toolbar_rename_tip"))
+
         zoom_act = toolbar.addAction(toolbar_icon("zoom"), tr("toolbar_zoom"))
         zoom_act.triggered.connect(self._cycle_thumbnail_size)
         zoom_act.setToolTip(tr("toolbar_zoom_tip"))
@@ -1495,26 +1501,6 @@ class BookshelfWindow(QMainWindow):
         """本棚モードのヘルプを表示"""
         from help_docs import show_help_dialog
         show_help_dialog(self, "shelf")
-
-    def create_menubar(self):
-        menubar = self.menuBar()
-        menubar.setContextMenuPolicy(Qt.PreventContextMenu)
-        file_menu = menubar.addMenu(tr("menu_file"))
-        # スタイル未指定だとFusionスタイルの暗色背景で表示されるため木目調に合わせる
-        file_menu.setStyleSheet("""
-            QMenu {
-                background: #faf5ee; border: 1px solid #8b5a2b;
-                border-radius: 6px; padding: 4px;
-            }
-            QMenu::item { padding: 8px 24px; color: #1a1a1a; font-size: 13px; }
-            QMenu::item:selected { background: #e8d8b8; border-radius: 4px; }
-        """)
-        act_folder = QAction(tr("menu_add_folder"), self)
-        act_folder.triggered.connect(self.add_folder_dialog)
-        file_menu.addAction(act_folder)
-        act_file = QAction(tr("menu_add_file"), self)
-        act_file.triggered.connect(self.add_file_dialog)
-        file_menu.addAction(act_file)
 
     def _show_add_menu(self):
         menu = QMenu(self)
@@ -2391,8 +2377,9 @@ class BookshelfWindow(QMainWindow):
             self._search_worker.stop()
             try:
                 self._search_worker.result_ready.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
+        self._retire_thread(self._search_thread)
         self._search_worker = None
         self._search_thread = None
 
@@ -2419,8 +2406,16 @@ class BookshelfWindow(QMainWindow):
     def refresh_view(self):
         # シリーズ内表示は通常表示に戻す（_open_series はここを通らない）
         self._series_view = None
-        # フォルダ移動時は選択アイテム名のパンくずをクリアする
+        # フォルダ移動時は選択アイテム名のパンくずをクリアする。
+        # あわせてリストのカレント/選択も明示的に解除する。これをしないと、
+        # 直前フォルダで選択していたアイテム（読んでいた本など）がカレントとして
+        # 残り、モデル再構築のタイミングで _on_current_changed が古い名前を
+        # パンくず末尾に復活させてしまうことがある。
         self._selected_crumb = None
+        sm = self.list_view.selectionModel()
+        if sm is not None:
+            sm.clearSelection()
+            sm.clearCurrentIndex()
         # ① 世代番号を進める（古いワーカーの結果を無視するため）
         self._view_generation += 1
         current_gen = self._view_generation
@@ -2442,8 +2437,10 @@ class BookshelfWindow(QMainWindow):
         self.path_label.setText(label if self.settings["show_hierarchy"] else "")
         self._update_breadcrumb()
 
-        self.scan_progress_label.setText(tr("loading"))
-        self.scan_progress_label.setVisible(True)
+        # 「読み込み中...」はヘッダー行に置くと表示/非表示のたびにレイアウトが
+        # 横にずれてしまうため出さない（スキャン中は前フォルダの内容がそのまま
+        # 残り、完了時に差し替わるのでちらつかない）。
+        self.scan_progress_label.setVisible(False)
         self.loading_label.setVisible(False)
 
         # ③ スキャンワーカー起動
@@ -2461,34 +2458,50 @@ class BookshelfWindow(QMainWindow):
         self._scan_thread = thread
         thread.start()
 
+    def _retire_thread(self, thread, wait_ms: int = 300):
+        """スレッドを安全に退役させる。
+
+        すぐ止まればそれで終了。ネットワークドライブのスピンアップ等で
+        ワーカーが I/O ブロック中の場合は wait_ms 以内に終わらないため、
+        参照を _zombie_threads に移して保持したまま自然終了を待つ。
+        こうしないと呼び出し側が参照を None にした瞬間、実行中の QThread が
+        GC で破棄され「QThread: Destroyed while thread is still running」で
+        クラッシュする（スピンアップ待ちの 10〜15 秒で発生）。
+        """
+        if thread is None or not thread.isRunning():
+            return
+        thread.quit()
+        if thread.wait(wait_ms):
+            return
+        # まだブロック中 → 参照を保持して自然終了させる
+        self._zombie_threads.append(thread)
+        def _cleanup(t=thread):
+            try:
+                self._zombie_threads.remove(t)
+            except ValueError:
+                pass
+        thread.finished.connect(_cleanup)
+
     def _stop_scan_worker(self):
-        """スキャンスレッドをシグナル切断 → quit → wait で安全停止"""
+        """スキャンスレッドをシグナル切断 → quit → 退役で安全停止"""
         if self._scan_worker:
             try:
                 self._scan_worker.scan_done.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
-        try:
-            stop_thread_safely(self._scan_thread)
-        except RuntimeError:
-            pass
+        self._retire_thread(self._scan_thread)
         self._scan_worker = None
         self._scan_thread = None
 
     def _stop_thumbnail_worker(self):
-        """サムネイルスレッドをフラグ → シグナル切断 → quit → wait で安全停止"""
+        """サムネイルスレッドをフラグ → シグナル切断 → quit → 退役で安全停止"""
         if self._thumb_worker:
             self._thumb_worker.stop()
             try:
                 self._thumb_worker.thumbnails_batch.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
-        try:
-            # キャッシュなし2000ファイルの場合でもrun()がcancel_futures=Trueで即帰るため
-            # 既実行中ワーカー(最大8)の1枚分待ちで済む。余裕を持って10秒に設定
-            stop_thread_safely(self._thumb_thread, timeout_ms=10000)
-        except RuntimeError:
-            pass
+        self._retire_thread(self._thumb_thread)
         self._thumb_worker = None
         self._thumb_thread = None
 
@@ -2886,15 +2899,32 @@ class BookshelfWindow(QMainWindow):
         self._show_shelf()
         self.refresh_view()
 
+    def _crumb_name_for_item(self, item, path: str) -> str:
+        """パンくず末尾に出す名前を返す。ファイルは拡張子付きの実ファイル名、
+        フォルダは表示名（解析済みタイトル）を使う。"""
+        is_dir = item.data(IS_DIR_ROLE)
+        if is_dir is None:
+            is_dir = not bool(Path(path).suffix)
+        if is_dir:
+            return item.data(TITLE_ROLE) or Path(path).name
+        return Path(path).name
+
     def _on_current_changed(self, current, previous=None):
         """カレント項目が変わったら（マウスクリック・キーボード移動の両方）
         その名前をパンくずリスト末尾に表示する。"""
         if current is None or not current.isValid():
             return
         item = self.model.itemFromIndex(current)
-        if not item or item.data(PLACEHOLDER_ROLE) or not item.data(Qt.UserRole):
+        if not item or item.data(PLACEHOLDER_ROLE):
             return
-        name = item.data(TITLE_ROLE) or Path(item.data(Qt.UserRole)).name
+        path = item.data(Qt.UserRole)
+        if not path:
+            return
+        # 現在表示中のフォルダに属さないアイテム（モデル再構築途中の古い残留選択など）は無視。
+        # これで前フォルダで選択していた本の名前がパンくずに残る問題を防ぐ。
+        if path not in self._item_map:
+            return
+        name = self._crumb_name_for_item(item, path)
         if name == self._selected_crumb:
             return
         self._selected_crumb = name
@@ -3084,8 +3114,19 @@ class BookshelfWindow(QMainWindow):
         # ビューアで開いていたファイルのキャッシュ状態を更新
         self._update_cached_role(self._viewer_file_path)
         if self._saved_scroll_path and self._item_map:
+            # パンくず末尾に出す「開いていた本の名前」を復元前に確保しておく
+            # （_restore_scroll_position が末尾で _viewer_file_path を None にするため）
+            vf = self._viewer_file_path
             # 本棚が既に構築済み → そのままスクロール復元
             self._restore_scroll_position()
+            # パンくずを現在フォルダ＋開いていた本の名前で作り直す。
+            # 選択名が変わらない場合は _on_current_changed が早期リターンするため、
+            # また全画面↔通常でウィンドウ高さが変わり位置がずれるため、明示的に更新する。
+            if vf:
+                vp = self._item_map.get(vf)
+                if vp is not None:
+                    self._selected_crumb = self._crumb_name_for_item(vp, vf)
+            self._update_breadcrumb()
         else:
             # 本棚が未構築 → list_viewとloading_labelを非表示にしてスキャン
             # スキャン完了後にスクロール復元してから表示する
@@ -3173,6 +3214,8 @@ class BookshelfWindow(QMainWindow):
 
     def show_context_menu(self, position):
         menu = QMenu()
+        menu.addAction(tr("menu_rename")).triggered.connect(self.rename_selected)
+        menu.addSeparator()
         menu.addAction(tr("ctx_remove")).triggered.connect(self.remove_selected)
         menu.exec(self.list_view.mapToGlobal(position))
 
@@ -3186,6 +3229,128 @@ class BookshelfWindow(QMainWindow):
             self.registered_items.remove(path_str)
             self.save_library()
             self.refresh_view()
+
+    def _selected_item(self):
+        """現在選択中のアイテム（プレースホルダー除く）を返す。無ければ None。"""
+        indexes = self.list_view.selectedIndexes()
+        if not indexes:
+            return None
+        item = self.model.itemFromIndex(indexes[0])
+        if item is None or item.data(PLACEHOLDER_ROLE):
+            return None
+        return item
+
+    def rename_selected(self):
+        """選択中のファイル／フォルダの名前を変更する。
+        ダイアログの初期値は現在のファイル名。実ファイルをリネームし、
+        ライブラリ登録・閲覧履歴・読書進捗のパス参照も追従させる。"""
+        item = self._selected_item()
+        if item is None:
+            _info_msg(self, tr("rename_no_sel_title"), tr("rename_no_sel_text"))
+            return
+        path_str = item.data(Qt.UserRole)
+        if not path_str:
+            return
+        old_path = Path(path_str)
+
+        # ---- 入力ダイアログ（初期値=現在名。ファイルは拡張子以外を選択状態にする） ----
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("rename_title"))
+        dlg.setMinimumWidth(420)
+        dlg.setStyleSheet("QDialog { background: #faf5ee; }")
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(16, 14, 16, 14)
+        lbl = QLabel(tr("rename_label"))
+        lbl.setStyleSheet("color: #1a0800; font-size: 11pt;")
+        v.addWidget(lbl)
+        edit = QLineEdit(old_path.name)
+        edit.setStyleSheet(
+            "background: white; color: #1a1a1a; border: 1px solid #aaa;"
+            "border-radius: 4px; padding: 6px 8px; font-size: 11pt;")
+        v.addWidget(edit)
+        # 拡張子を除いた本体部分を選択（ファイルのみ。フォルダは全選択）
+        stem_len = len(old_path.stem) if old_path.suffix else len(old_path.name)
+        edit.setSelection(0, stem_len)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton(tr("dialog_cancel"))
+        btn_ok = QPushButton(tr("dialog_ok"))
+        for b in (btn_cancel, btn_ok):
+            b.setStyleSheet(
+                "QPushButton { background: #e8e0d5; color: #1a1a1a; border: 1px solid #bbb;"
+                "border-radius: 4px; padding: 6px 18px; }"
+                "QPushButton:default { background: #5a8a3c; color: white; border-color: #4a7a2c; }")
+        btn_ok.setDefault(True)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_ok.clicked.connect(dlg.accept)
+        edit.returnPressed.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        v.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_name = edit.text().strip()
+        if not new_name or new_name == old_path.name:
+            return
+        # 使用不可文字チェック
+        if any(c in new_name for c in '\\/:*?"<>|'):
+            _info_msg(self, tr("rename_err_title"), tr("rename_invalid"))
+            return
+        new_path = old_path.parent / new_name
+        if new_path.exists():
+            _info_msg(self, tr("rename_err_title"), tr("rename_exists"))
+            return
+
+        # ---- 実ファイルのリネーム ----
+        try:
+            old_path.rename(new_path)
+        except Exception as e:
+            _info_msg(self, tr("rename_err_title"), tr("rename_failed", err=str(e)))
+            return
+
+        # ---- パス参照の追従（ライブラリ・履歴・進捗） ----
+        old_s, new_s = str(old_path), str(new_path)
+        if old_s in self.registered_items:
+            self.registered_items[self.registered_items.index(old_s)] = new_s
+            self.save_library()
+        self._migrate_path_references(old_path, new_path)
+
+        # 選択・スクロール位置を維持したまま再表示
+        self._saved_scroll_path = new_s
+        self._viewer_file_path = new_s
+        self.refresh_view()
+
+    def _migrate_path_references(self, old_path: Path, new_path: Path):
+        """リネームに伴い、閲覧履歴と読書進捗のパス参照を新パスへ移す。"""
+        old_s, new_s = str(old_path), str(new_path)
+        # 閲覧履歴
+        try:
+            entries = self._load_history()
+            changed = False
+            for e in entries:
+                if e.get("path") == old_s:
+                    e["path"] = new_s
+                    changed = True
+            if changed:
+                HISTORY_FILE.write_text(
+                    json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+        # 読書進捗・しおり・回転（progress.json は MD5(パス) がキーのため付け替える）
+        try:
+            from viewer import load_progress, _progress_key, PROGRESS_FILE
+            data = load_progress()
+            ok = _progress_key(old_path)
+            if ok in data:
+                entry = data.pop(ok)
+                entry["path"] = new_s
+                data[_progress_key(new_path)] = entry
+                PROGRESS_FILE.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # 終了処理（全スレッドを安全に停止）
@@ -3225,13 +3390,20 @@ class BookshelfWindow(QMainWindow):
             except Exception:
                 pass
 
-        # 全ワーカーにstopフラグを立てる
+        # ① 先に全状態を保存する（この後スレッドが止まらず強制終了に至っても
+        #    ライブラリ・進捗・ウィンドウ状態が失われないようにするため）
+        try:
+            if self.settings["remember_last_location"]:
+                self._save_last_location()
+            self._save_all_state()
+        except Exception:
+            pass
+
+        # ② 全ワーカーにstopフラグを立ててシグナルを切断
         if self._thumb_worker:
             self._thumb_worker.stop()
         if self._search_worker:
             self._search_worker.stop()
-
-        # シグナルを切断してからスレッドを強制停止
         for worker, thread in [
             (self._thumb_worker,   self._thumb_thread),
             (self._scan_worker,    self._scan_thread),
@@ -3242,23 +3414,33 @@ class BookshelfWindow(QMainWindow):
                 for sig_name in ('thumbnails_batch', 'scan_done', 'result_ready', 'done'):
                     try:
                         getattr(worker, sig_name, None) and getattr(worker, sig_name).disconnect()
-                    except RuntimeError:
+                    except (RuntimeError, TypeError):
                         pass
-            if thread:
-                try:
-                    if thread.isRunning():
-                        thread.quit()
-                        if not thread.wait(2000):   # 2秒待って終わらなければ強制終了
-                            thread.terminate()
-                            thread.wait(2000)
-                except RuntimeError:
-                    pass
 
-        if self.settings["remember_last_location"]:
-            self._save_last_location()
+        # ③ スレッドを quit して短時間だけ待つ
+        threads = [self._thumb_thread, self._scan_thread,
+                   self._search_thread, self._startup_thread]
+        still_running = False
+        for thread in threads:
+            if thread is None:
+                continue
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    if not thread.wait(1500):
+                        still_running = True
+            except RuntimeError:
+                pass
 
-        # 全状態を1回にまとめて保存
-        self._save_all_state()
+        # ④ ネットワークドライブのスピンアップ待ち等でまだブロック中のスレッドが
+        #    ある場合、Qtの通常終了に任せると実行中QThreadのデストラクタが走って
+        #    「Destroyed while running」でアボートする（terminate() も同様）。
+        #    状態は①で保存済みなので、プロセスを即座に安全終了させる。
+        if still_running:
+            print("バックグラウンド処理の終了待ちを省略してアプリを終了します。")
+            import os as _os
+            _os._exit(0)
+
         super().closeEvent(event)
 
     def _save_all_state(self):

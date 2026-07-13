@@ -13,6 +13,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QAction, QIcon, QFont, QColor
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QObject
 
+# ネットワークドライブのスピンアップ待ち等でブロック中のページ読み込みスレッドを
+# ビューア破棄後も参照保持して自然終了させるためのグローバルリスト。
+# （実行中QThreadが破棄されると "Destroyed while running" でクラッシュするため）
+_KEEPALIVE_THREADS: list = []
+
 # ============================================================
 # キー割り当て（settings.json の "keymap" で上書き可能）
 # ============================================================
@@ -484,9 +489,21 @@ class ViewerWindow(QMainWindow):
     # ⑤ 非同期ページ読み込み
     # ------------------------------------------------------------------ #
 
+    LOAD_TIMEOUT_MS = 10000  # 読み込みタイムアウト（ネットワークドライブのスピンアップ待ち上限）
+
     def _start_page_load(self):
         """バックグラウンドでページリストを構築する"""
         self._set_loading(True)
+
+        # 読み込みタイムアウト: 10秒でページが1枚も来なければ
+        # 「読み込めませんでした」を表示する（ドライブが眠っていて応答しない場合）
+        from PySide6.QtCore import QTimer
+        if getattr(self, '_load_timeout_timer', None) is not None:
+            self._load_timeout_timer.stop()
+        self._load_timeout_timer = QTimer(self)
+        self._load_timeout_timer.setSingleShot(True)
+        self._load_timeout_timer.timeout.connect(self._on_load_timeout)
+        self._load_timeout_timer.start(self.LOAD_TIMEOUT_MS)
 
         worker = PageLoadWorker(self.file_path)
         thread = QThread(self)   # parent=self → ViewerWindow が生きている間はスレッドも生きる
@@ -503,8 +520,23 @@ class ViewerWindow(QMainWindow):
         self._page_thread = thread
         thread.start()
 
+    def _cancel_load_timeout(self):
+        t = getattr(self, '_load_timeout_timer', None)
+        if t is not None:
+            t.stop()
+
+    def _on_load_timeout(self):
+        """10秒経ってもページが1枚も届かない → 読み込み失敗表示にする。
+        ワーカーは parent=self で生かしたまま（ドライブが後で目覚めれば
+        ページが届いて自動的に表示に切り替わる）。ユーザーは Esc で本棚へ戻れる。"""
+        if self.pages or self._streaming_done:
+            return
+        self.loading_label.setText(tr("viewer_load_timeout"))
+
     def _on_page_ready(self, index: int, data: bytes):
         """ZIPストリーミング: 1ページ読めたら即追加・表示"""
+        # ページが届いた → 読み込みタイムアウトを解除
+        self._cancel_load_timeout()
         # load_done完了後は不要（重複防止）
         if self._streaming_done:
             return
@@ -534,7 +566,13 @@ class ViewerWindow(QMainWindow):
 
     def _on_load_done(self, pages: list, page_type: str, initial_index: int, page_names: list):
         """ページリスト構築完了 → 全ページ確定"""
+        self._cancel_load_timeout()
         self._streaming_done = True
+        # 読み込み完了したが画像が1枚も無い（展開失敗・空アーカイブ等）場合は
+        # 「読み込めませんでした」を表示する（ローディング画面のまま・空ビューア）
+        if not pages:
+            self.loading_label.setText(tr("viewer_load_timeout"))
+            return
         # ストリーミング途中で縦スクロールに切り替えていた場合はページ数が確定したので再構築
         if self._view_layout == "vertical":
             self._exit_vertical_mode()
@@ -702,7 +740,7 @@ class ViewerWindow(QMainWindow):
                 from PySide6.QtGui import QPainter as _QPainter
                 from PySide6.QtCore import QByteArray
                 renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
-                pix = QPixmap(28, 28)
+                pix = QPixmap(128, 128)   # 高解像度で描画（表示サイズへは縮小されるので鮮明）
                 pix.fill(Qt.transparent)
                 p = _QPainter(pix)
                 renderer.render(p)
@@ -736,7 +774,7 @@ class ViewerWindow(QMainWindow):
             btn = QToolButton()
             btn.setText(text)
             btn.setIcon(_lucide_icon(icon_key))
-            btn.setIconSize(QSize(24, 24))
+            btn.setIconSize(QSize(32, 32))
             btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
             btn.setAutoRaise(True)
             btn.setStyleSheet(TOP_BTN_STYLE)
@@ -776,7 +814,7 @@ class ViewerWindow(QMainWindow):
 
         # ---- 上段: アイコンボタン行 ----
         btn_row = WoodOverlayWidget(wood_pixmap, border_bottom=True)
-        btn_row.setFixedHeight(60)
+        btn_row.setFixedHeight(66)
         btn_row.setStyleSheet("border: none;")
         bottom_layout = QHBoxLayout(btn_row)
         bottom_layout.setContentsMargins(12, 2, 12, 2)
@@ -800,7 +838,7 @@ class ViewerWindow(QMainWindow):
             btn = QToolButton()
             btn.setText(text)
             btn.setIcon(_lucide_icon(icon_key))
-            btn.setIconSize(QSize(22, 22))
+            btn.setIconSize(QSize(30, 30))
             btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
             btn.setAutoRaise(True)
             btn.setStyleSheet(BOTTOM_BTN_STYLE)
@@ -2264,7 +2302,11 @@ class ViewerWindow(QMainWindow):
         vlay.setSpacing(6)
         self._vpage_labels = []
         self._vloaded = set()
-        default_h = max(200, int(self.scroll_area.viewport().width() * 1.42))
+        # 1ページ＝1画面（縦フィット）なので、未ロードのプレースホルダー高さは
+        # 画面高さを基準にする（確定前は横幅×1.42で代替）
+        _vp = self.scroll_area.viewport()
+        default_h = max(200, _vp.height() if _vp.height() > 50
+                        else int(_vp.width() * 1.42))
         for _ in range(len(self.pages)):
             lbl = QLabel()
             lbl.setAlignment(Qt.AlignCenter)
@@ -2327,7 +2369,11 @@ class ViewerWindow(QMainWindow):
             if near and i not in self._vloaded:
                 pix = self._get_pixmap(i)
                 if pix and not pix.isNull():
-                    scaled = pix.scaledToWidth(vw, Qt.SmoothTransformation)
+                    # 画面の縦横両方に収まるようにスケール（縦フィット）。
+                    # scaledToWidth だと縦長ページが画面高さを超えて1画面に
+                    # 収まらないため、(vw, vh) のボックスにKeepAspectRatioで収める。
+                    scaled = pix.scaled(vw, max(100, vh - 4),
+                                        Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     lbl.setFixedHeight(scaled.height())
                     lbl.setPixmap(scaled)
                     self._vloaded.add(i)
@@ -2622,8 +2668,8 @@ class ViewerWindow(QMainWindow):
         central = self._central_stack
         w = max(central.width(), self.width())
         h = max(central.height(), self.height())
-        top_h = 64
-        bottom_h = 4 + 60 + 2 + 160  # margin(4) + ボタン行(60) + spacing(2) + サムネイル行(160)
+        top_h = 70
+        bottom_h = 4 + 66 + 2 + 160  # margin(4) + ボタン行(66) + spacing(2) + サムネイル行(160)
         self.top_overlay.setGeometry(0, 0, w, top_h)
         self.bottom_overlay.setGeometry(0, h - bottom_h, w, bottom_h)
         self.top_overlay.raise_()
@@ -2756,19 +2802,31 @@ class ViewerWindow(QMainWindow):
     def closeEvent(self, event):
         self._slideshow_stop()
         self._stop_strip_worker()
+        self._cancel_load_timeout()
         # ワーカーにキャンセルを伝えてシグナルを切断
         if self._page_worker:
             self._page_worker.cancel()
             try:
                 self._page_worker.load_done.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
-        # スレッドは parent=self で管理されているので
-        # isRunning() を呼ばず quit() だけ呼ぶ（既に停止済みでも無害）
         if self._page_thread is not None:
             try:
                 self._page_thread.quit()
-                self._page_thread.wait(300)
+                if not self._page_thread.wait(300):
+                    # ネットワークI/Oでブロック中 → 親から切り離してグローバル保持。
+                    # ViewerWindow破棄時に実行中スレッドが道連れで破棄されて
+                    # 「Destroyed while running」でクラッシュするのを防ぐ。
+                    th = self._page_thread
+                    wk = self._page_worker
+                    th.setParent(None)
+                    _KEEPALIVE_THREADS.append((th, wk))
+                    def _cleanup(t=th, w=wk):
+                        try:
+                            _KEEPALIVE_THREADS.remove((t, w))
+                        except ValueError:
+                            pass
+                    th.finished.connect(_cleanup)
             except RuntimeError:
                 pass  # C++オブジェクトが既に削除済み → 無視
 

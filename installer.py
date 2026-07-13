@@ -15,7 +15,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME    = "Comic Viewer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.3.0"
 APP_EXE     = "ComicViewer.exe"
 REG_KEY     = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ComicViewer"
 

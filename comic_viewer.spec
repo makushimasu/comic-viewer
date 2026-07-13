@@ -1,5 +1,6 @@
-# -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for comic_viewer
+# comic_viewer.spec  — PyInstaller ビルド設定
+# 使い方: pyinstaller comic_viewer.spec --clean --noconfirm
+#         または build.bat を実行
 
 block_cipher = None
 
@@ -7,101 +8,69 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('icon.png', '.')],
     hiddenimports=[
-        'PIL._imaging',
-        'PIL.Image',
-        'PIL.ImageFilter',
-        'PySide6.QtCore',
-        'PySide6.QtGui',
-        'PySide6.QtWidgets',
-        'PySide6.QtXml',
-        'PySide6.QtSvg',
         # ローカルモジュール（import chainで拾われない場合の保険）
         'archive', 'core', 'viewer', 'settings', 'i18n', 'utils',
         'page_cache', 'wood_bg', 'appdir', 'help_docs',
-        # PDF対応
+        # PySide6: 動的ロードされるモジュール
+        'PySide6.QtSvg',
+        'PySide6.QtXml',
+        'PySide6.QtPrintSupport',
+        # PDF対応（pdfium DLLはhooks-contribが自動収集する）
         'pypdfium2', 'pypdfium2_raw',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
+    # 明らかに不要なPySide6モジュールを除外してサイズを削減
     excludes=[
-        'tkinter', 'matplotlib', 'numpy', 'scipy',
-        # 未使用の Qt モジュールを除外してサイズ削減
-        'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtQmlModels',
-        'PySide6.QtQmlMeta', 'PySide6.QtQmlWorkerScript',
-        'PySide6.QtPdf', 'PySide6.QtPdfWidgets',
-        'PySide6.QtLocation', 'PySide6.QtPositioning',
-        'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets',
-        'PySide6.QtWebEngine', 'PySide6.QtWebEngineCore',
-        'PySide6.QtWebEngineWidgets', 'PySide6.QtWebChannel',
-        'PySide6.QtBluetooth', 'PySide6.QtNfc',
-        'PySide6.QtSensors', 'PySide6.QtSerialPort',
-        'PySide6.Qt3DCore', 'PySide6.Qt3DRender',
-        'PySide6.QtCharts', 'PySide6.QtDataVisualization',
-        'PySide6.QtVirtualKeyboard',
+        'tkinter',
+        'PySide6.Qt3DAnimation', 'PySide6.Qt3DCore', 'PySide6.Qt3DExtras',
+        'PySide6.Qt3DInput',     'PySide6.Qt3DLogic', 'PySide6.Qt3DRender',
+        'PySide6.QtBluetooth',   'PySide6.QtCharts',  'PySide6.QtDataVisualization',
+        'PySide6.QtMultimedia',  'PySide6.QtMultimediaWidgets',
+        'PySide6.QtNfc',         'PySide6.QtPositioning',
+        'PySide6.QtQml',         'PySide6.QtQuick',   'PySide6.QtQuickControls2',
+        'PySide6.QtQuickWidgets','PySide6.QtRemoteObjects',
+        'PySide6.QtSensors',     'PySide6.QtSerialBus','PySide6.QtSerialPort',
+        'PySide6.QtSpatialAudio','PySide6.QtSql',     'PySide6.QtStateMachine',
+        'PySide6.QtTest',        'PySide6.QtTextToSpeech',
+        'PySide6.QtWebChannel',  'PySide6.QtWebEngineCore',
+        'PySide6.QtWebEngineQuick','PySide6.QtWebEngineWidgets',
+        'PySide6.QtWebSockets',
     ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
+    optimize=0,
 )
 
-# 使わない Qt .so を除去してサイズ削減
-_EXCLUDE_LIBS = {
-    'libQt6Quick', 'libQt6Qml', 'libQt6QmlModels', 'libQt6QmlMeta',
-    'libQt6QmlWorkerScript', 'libQt6Pdf', 'libQt6PdfWidgets',
-    'libQt6Location', 'libQt6Positioning', 'libQt6PositioningQuick',
-    'libQt6Multimedia', 'libQt6MultimediaWidgets', 'libQt6MultimediaQuick',
-    'libQt6WebEngineCore', 'libQt6WebEngineWidgets', 'libQt6WebChannel',
-    'libQt6Bluetooth', 'libQt6Nfc', 'libQt6Sensors',
-    'libQt6VirtualKeyboard', 'libQt6Charts', 'libQt6DataVisualization',
-    'libQt63DCore', 'libQt63DRender',
-}
-
-def _keep(name):
-    base = name.split('/')[-1].split('.')[0]
-    return base not in _EXCLUDE_LIBS
-
-a.binaries = [(n, p, t) for n, p, t in a.binaries if _keep(n)]
-a.datas    = [(n, p, t) for n, p, t in a.datas    if _keep(n)]
-
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, cipher=block_cipher)
 
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
-    name='comic_viewer',
+    name='ComicViewer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    console=False,
+    upx=False,              # UPX圧縮無効（有効にするとAVの誤検知が増える）
+    console=False,          # コンソールウィンドウを非表示
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='icon.ico',
 )
 
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
-    strip=True,
-    upx=True,
+    strip=False,
+    upx=False,
     upx_exclude=[],
-    name='comic_viewer',
+    name='ComicViewer',
 )
-
-# ビルド後にスクリプト・アイコンをコピー
-import shutil, os
-_dist = os.path.join(DISTPATH, 'comic_viewer')
-for _f in ['install.sh', 'uninstall.sh', 'icon.png']:
-    shutil.copy(os.path.join(SPECPATH, _f), os.path.join(_dist, _f))
-os.chmod(os.path.join(_dist, 'install.sh'),   0o755)
-os.chmod(os.path.join(_dist, 'uninstall.sh'), 0o755)
